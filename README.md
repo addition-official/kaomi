@@ -77,7 +77,9 @@ flicker), and any click outside the panel still closes it. If you switch to
 another app before a pick has gone in, that pick is dropped rather than typed
 into the wrong app.
 
-Recently used shows the last 3 rows of emoji you picked.
+Recently used shows the last 3 rows of emoji you picked. Right-click one (or
+select it and press **Delete** with the search box empty) to remove it from
+there.
 
 ## What setup changes on your system
 

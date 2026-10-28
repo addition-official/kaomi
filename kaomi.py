@@ -432,13 +432,23 @@ TAB_KEYS = ["recent", "smileys", "people", "animals", "food", "travel",
             "activities", "objects", "symbols", "flags"]
 
 
+_ICON_CACHE = {}
+
+
 def svg_icon(name, color, px=20):
+    dpr = max(1.0, QGuiApplication.instance().devicePixelRatio())
+    scale = max(2, math.ceil(dpr))
+    key = (name, color, px, scale)
+    if key not in _ICON_CACHE:             # every clipboard row uses the same few icons
+        _ICON_CACHE[key] = _render_svg_icon(name, color, px, scale)
+    return _ICON_CACHE[key]
+
+
+def _render_svg_icon(name, color, px, scale):
     body = SVG[name].replace('"C"', f'"{color}"')
     svg = (f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" '
            f'stroke="{color}" stroke-width="1.6" stroke-linecap="round" '
            f'stroke-linejoin="round">{body}</svg>')
-    dpr = max(1.0, QGuiApplication.instance().devicePixelRatio())
-    scale = max(2, math.ceil(dpr))
     pm = QPixmap(px * scale, px * scale)
     pm.fill(Qt.GlobalColor.transparent)
     p = QPainter(pm)
@@ -1601,6 +1611,17 @@ class ClipItem:
         raw = payload.encode() if kind == "text" else payload
         self.hash = hashlib.sha1(raw).hexdigest()
         self._thumb = None
+        self._preview = None
+
+    def preview(self, max_h):
+        """Small copy for the history card, made once: scaling a full screenshot
+        on every open is what makes a long history slow to show."""
+        if self._preview is None or self._preview[0] != max_h:
+            pm = self.thumb_full()
+            if not pm.isNull() and pm.height() > max_h * 2:
+                pm = pm.scaledToHeight(max_h * 2, Qt.TransformationMode.SmoothTransformation)
+            self._preview = (max_h, pm)
+        return self._preview[1]
 
     def thumb_full(self):
         if self._thumb is None:
@@ -2288,7 +2309,7 @@ class ClipRow(QWidget):
             body = WrapLabel(it.payload, 3)
             body.setObjectName("cardText")
         else:
-            body = ThumbLabel(it.thumb_full(), h - 16)
+            body = ThumbLabel(it.preview(h - 16), h - 16)
         body.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
         lay.addWidget(body, 1, Qt.AlignmentFlag.AlignTop)            # text starts at the top
         side = QVBoxLayout(); side.setSpacing(0); side.setContentsMargins(0, 0, 0, 0)
@@ -2349,6 +2370,8 @@ class ClipRow(QWidget):
             self.slider.move(target)
 
     def set_selected(self, on):
+        if self.card.property("sel") is on:
+            return                              # re-polishing every row is slow with a long history
         self.card.setProperty("sel", on)
         self.card.style().unpolish(self.card); self.card.style().polish(self.card)
 
@@ -2365,10 +2388,14 @@ class ClipRow(QWidget):
 
 
 class ClipboardPage(QWidget):
+    BATCH = 12          # rows built at a time; more are added as you scroll down
+
     def __init__(self, picker, store):
         super().__init__()
         self.picker, self.store = picker, store
         self.cards = []
+        self.items = []
+        self.row_h = 80
         self.sel = 0
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         lay = QVBoxLayout(self); lay.setContentsMargins(0, 4, 0, 0); lay.setSpacing(8)
@@ -2386,6 +2413,8 @@ class ClipboardPage(QWidget):
         self.inner.installEventFilter(self)          # click on empty space: slide rows back
         self.list = QVBoxLayout(self.inner); self.list.setContentsMargins(0, 0, 10, 4); self.list.setSpacing(8)
         self.scroll.setWidget(self.inner)
+        self.scroll.verticalScrollBar().valueChanged.connect(self._near_end)
+        self.scroll.verticalScrollBar().rangeChanged.connect(self._near_end)
         lay.addWidget(self.scroll, 1)
         self.dirty = False
         store.changed.connect(self.on_store_changed)
@@ -2418,21 +2447,39 @@ class ClipboardPage(QWidget):
             empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
             self.list.addSpacing(40); self.list.addWidget(empty)
         fm = QFontMetrics(self.font())
-        row_h = max(80, fm.lineSpacing() * 3 + 26)          # same height for every item
-        for it in items:
-            c = ClipRow(self, it, row_h)
-            self.cards.append(c); self.list.addWidget(c)
+        self.row_h = max(80, fm.lineSpacing() * 3 + 26)     # same height for every item
+        self.items = items
         self.list.addStretch()
         self.clear_btn.setEnabled(bool(self.store.history))
-        ids = [c.it.id for c in self.cards]
+        ids = [it.id for it in items]
         if keep in ids:
             self.sel = ids.index(keep)             # same item stays selected after reordering
-        self.sel = min(self.sel, len(self.cards) - 1) if self.cards else 0
+        self.sel = min(self.sel, len(items) - 1) if items else 0
+        # building every row up front made a long history slow to open: build
+        # one screenful (and up to the selected item), the rest as you scroll
+        self._more(max(self.BATCH, self.sel + 1))
         self.select(self.sel, scroll=False)
+
+    def _more(self, upto):
+        """Build rows until there are `upto` of them (or no more items)."""
+        upto = min(upto, len(self.items))
+        while len(self.cards) < upto:
+            c = ClipRow(self, self.items[len(self.cards)], self.row_h)
+            self.cards.append(c)
+            self.list.insertWidget(self.list.count() - 1, c)     # above the stretch
+
+    def _near_end(self, *_):
+        if len(self.cards) >= len(self.items):
+            return
+        sb = self.scroll.verticalScrollBar()
+        if sb.maximum() - sb.value() < 3 * (self.row_h + 8):
+            self._more(len(self.cards) + self.BATCH)
 
     def select(self, i, scroll=True):
         if not self.cards:
             return
+        if i >= len(self.cards):
+            self._more(i + self.BATCH)             # arrowing past the built rows
         i = max(0, min(i, len(self.cards) - 1))
         for k, c in enumerate(self.cards):
             c.set_selected(k == i and self.hasFocus())
@@ -2579,7 +2626,9 @@ class EmojiGrid(QWidget):
         super().__init__()
         self.picker = picker
         self.setMouseTracking(True)
-        self.sections = []   # (title, [(display, name, base)])
+        self.sections = []   # (title, [(display, name, base)]), as laid out
+        self.all_sections = []
+        self.row_caps = {}   # section index -> most rows it may take
         self.pos = []        # flat list of (QRectF, item)
         self.section_tops = []
         self.hover = -1
@@ -2591,8 +2640,11 @@ class EmojiGrid(QWidget):
         # header height follows the real font size, so big system fonts can't overlap
         self.header_h = QFontMetrics(self.hfont).height() + 16
 
-    def set_sections(self, sections):
-        self.sections = sections
+    def set_sections(self, sections, row_caps=None):
+        """row_caps: {section index: rows}. Applied in relayout, at the grid's real
+        width; counting items before the grid is laid out (its width is still
+        Qt's default 640 then) let "Recently used" spill past its rows."""
+        self.all_sections, self.row_caps = sections, row_caps or {}
         self.hover = -1
         self.sel = 0 if any(s[1] for s in sections) else -1
         self.relayout()
@@ -2611,6 +2663,8 @@ class EmojiGrid(QWidget):
 
     def relayout(self):
         cols, x0, cw = self.cols(), self.x0(), self.cell_w()
+        self.sections = [(t, items[:self.row_caps[k] * cols] if k in self.row_caps else items)
+                         for k, (t, items) in enumerate(self.all_sections)]
         y = 0
         self.pos, self.section_tops = [], []
         for title, items in self.sections:
@@ -2623,6 +2677,8 @@ class EmojiGrid(QWidget):
                 r, c = divmod(i, cols)
                 self.pos.append((QRectF(x0 + c * cw, y + r * CELL, cw, CELL), it))
             y += ((len(items) + cols - 1) // cols) * CELL + 8
+        self.sel = min(self.sel, len(self.pos) - 1)
+        self.hover = min(self.hover, len(self.pos) - 1)
         self.setMinimumHeight(max(y, 10))
         self.update()
 
@@ -2692,6 +2748,10 @@ class EmojiGrid(QWidget):
                 self.sel = i
                 self.update()
                 self.picker.pick(self.pos[i][1], via="mouse")
+        elif ev.button() == Qt.MouseButton.RightButton:
+            i = self.item_at(ev.position())
+            if i >= 0:
+                self.picker.remove_recent(i)       # right-click a recent emoji: forget it
 
     def move_sel(self, key):
         if not self.pos:
@@ -3407,11 +3467,11 @@ class Picker(QWidget):
                 b.setChecked(False)
             self.tab_group.setExclusive(True)
         else:
-            secs = [("Recently used", [self.disp(it) for it in self.recents()][:self.grid.cols() * RECENT_ROWS])]
+            secs = [("Recently used", [self.disp(it) for it in self.recents()])]
             secs += [(name, [self.disp(it) for it in items]) for name, items in self.groups]
             self.tabs[0].setEnabled(bool(secs[0][1]))
         self.searching = bool(q)
-        self.grid.set_sections(secs)
+        self.grid.set_sections(secs, None if q else {0: RECENT_ROWS})
         self.scroll.verticalScrollBar().setValue(0)
         self.sync_tab()
         self.show_info(self.grid.pos[0][1] if self.grid.pos else None)
@@ -3492,6 +3552,22 @@ class Picker(QWidget):
         self.conf["recent"] = ([it[0]] + rec)[:32]
         save_conf(self.conf)
         self.insert_text(text, via)
+
+    def remove_recent(self, i):
+        """Drop grid item i from "Recently used" (a stray click shouldn't keep its spot)."""
+        if self.searching or not self.grid.sections or i >= len(self.grid.sections[0][1]):
+            return                                   # not a recent
+        base = self.grid.pos[i][1][2][0]
+        self.conf["recent"] = [e for e in self.conf["recent"] if e != base]
+        save_conf(self.conf)
+        log(f"recent removed: {base}")
+        v = self.scroll.verticalScrollBar().value()
+        self.refresh()
+        self.grid.sel = min(i, len(self.grid.pos) - 1)
+        self.scroll.verticalScrollBar().setValue(v)
+        if self.grid.sel >= 0:
+            self.show_info(self.grid.pos[self.grid.sel][1])
+        self.grid.update()
 
     def pick_text(self, text, via, recent_key):
         """Kaomoji / symbols: same instant insert as emoji, with their own recents."""
@@ -4162,6 +4238,9 @@ class Picker(QWidget):
                 return True
             if k == Qt.Key.Key_Escape:
                 self.escape_action()
+                return True
+            if k == Qt.Key.Key_Delete and not self.search.text() and self.grid.sel >= 0:
+                self.remove_recent(self.grid.sel)    # only acts on a recent emoji
                 return True
             if k in (Qt.Key.Key_PageDown, Qt.Key.Key_PageUp):
                 sb = self.scroll.verticalScrollBar()
