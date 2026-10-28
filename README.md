@@ -65,7 +65,12 @@ then "Paste as text") pastes without formatting. **Delete** removes an item
 for good. **Ctrl+P** pins or unpins. Pinned items survive logout; the rest of
 the history (up to 200 items, images capped at 200 MB in total) is kept in
 memory only. Passwords (anything a password manager marks as secret) are
-never recorded.
+never recorded. Plasma's own clipboard history (Klipper) is separate: by
+default it saves text you copy to disk (`~/.local/share/klipper/`). Delete and
+Clear all here wipe that too; to stop it saving at all, turn off "Save history
+across desktop sessions" in its settings. With clipboard history off, deleting
+a pinned item leaves the clipboard alone, since Kaomi isn't keeping track of
+what is on it.
 
 Settings (the gear in the panel): close after inserting or stay open, which
 keys are used to paste clipboard items (Shift+Insert works in terminals,
@@ -83,7 +88,7 @@ there.
 
 ## What setup changes on your system
 
-Everything is undone by `kaomi --uninstall`.
+Everything except the installed packages is undone by `kaomi --uninstall`.
 
 - Packages: PyQt6, the Noto Color Emoji font, wl-clipboard and its build
   dependencies, AT-SPI, and the KWin development headers.

@@ -30,8 +30,8 @@ if "--version" in sys.argv:
 # ---------------------------------------------------------------- setup ----
 # "python3 kaomi.py --setup" installs or updates everything.
 # (Handled before any Qt import, since Qt may not be installed yet.)
-SETUP_SH = '#!/usr/bin/env bash\n# Installs (or updates) Kaomi, the Windows-style emoji picker + clipboard history for KDE Plasma.\n# Run:  python3 kaomi.py --setup\n# Safe to run again any time: it just updates everything and restarts the app.\n# Remove everything again with:  kaomi --uninstall\nset -e\nAPP=kaomi\nOLD=win-emoji-picker      # the name before 1.0\nBIN="$HOME/.local/bin/$APP"\nCONF_DIR="$HOME/.config/$APP"\n\nif [ "$(id -u)" -eq 0 ]; then\n  echo "Run setup as your normal user (without sudo). It asks for your password when needed."\n  exit 1\nfi\n\nSRC="${KAOMI_SRC:?}"     # the file you ran --setup from\necho "==> Setting up Kaomi version $(grep -m1 \'^VERSION\' "$SRC" | cut -d\'"\' -f2)"\n\n# Kaomi used to be called "win-emoji-picker": stop the old one, keep your\n# settings, pins and the built clipboard tool, and remove the old files.\nif [ -e "$HOME/.local/bin/$OLD" ] || [ -d "$HOME/.config/$OLD" ] || [ -d "$HOME/.local/share/$OLD" ]; then\n  echo "==> Moving over from $OLD (the old name)"\n  timeout 3 "$HOME/.local/bin/$OLD" --quit 2>/dev/null || true\n  sleep 0.5\n  pkill -u "$(id -u)" -f -x "[^ ]*python3[^ ]* $HOME/.local/bin/$OLD( --daemon| --clipboard)?" 2>/dev/null || true\n  pkill -u "$(id -u)" -f "$OLD-caret-helper" 2>/dev/null || true\n  for Q in qdbus6 qdbus; do\n    command -v $Q >/dev/null && { $Q org.kde.KWin /Scripting org.kde.kwin.Scripting.unloadScript \\\n        "$OLD-helper" >/dev/null 2>&1 || true; break; }\n  done\n  for d in .config .local/share .local/opt; do\n    if [ -d "$HOME/$d/$OLD" ] && [ ! -e "$HOME/$d/$APP" ]; then\n      mv "$HOME/$d/$OLD" "$HOME/$d/$APP"\n    elif [ -d "$HOME/$d/$OLD" ]; then\n      mv "$HOME/$d/$OLD" "$HOME/$d/$OLD.old-copy"      # already have the new one: keep aside\n    fi\n  done\n  # tied to the old name: KDE asks for the input permission once more\n  rm -f "$HOME/.local/share/$APP/portal-token" "$HOME/.local/share/$APP/kwin-helper.js"\n  rm -f "$HOME/.local/bin/$OLD" "$HOME/.local/share/applications/$OLD.desktop" \\\n        "$HOME/.local/share/applications/$OLD-clipboard.desktop" "$HOME/.config/autostart/$OLD-daemon.desktop" \\\n        "$HOME/.local/share/icons/hicolor/scalable/apps/$OLD.svg" \\\n        "$HOME/.local/share/icons/hicolor/scalable/apps/$OLD-clipboard.svg" "$HOME/.cache/$OLD".*log*\n  OLD_PLUGIN=y\nfi\n\nKW=kwriteconfig6; command -v $KW >/dev/null || KW=kwriteconfig5\nKR=kreadconfig6;  command -v $KR >/dev/null || KR=kreadconfig5\n\n# Meta+V question: asked once, answer remembered; defaults to yes without a terminal\nmkdir -p "$CONF_DIR"\nUSE_META_V=$(sed -n \'s/^META_V=//p\' "$CONF_DIR/setup.conf" 2>/dev/null || true)\nif [ -z "$USE_META_V" ]; then\n  USE_META_V=y\n  if [ -t 0 ]; then\n    read -r -p "Use Meta+V for the new clipboard history (instead of Plasma\'s)? [Y/n] " ans || ans=\n    case "$ans" in [nN]*) USE_META_V=n ;; esac\n  fi\n  echo "META_V=$USE_META_V" >> "$CONF_DIR/setup.conf"\nfi\n# remember how things were before we changed them, so --uninstall can put them back\nremember() { grep -q "^$1=" "$CONF_DIR/setup.conf" 2>/dev/null || echo "$1=$2" >> "$CONF_DIR/setup.conf"; }\nif busctl --user get-property org.a11y.Bus /org/a11y/bus org.a11y.Status IsEnabled 2>/dev/null | grep -q true; then\n  remember A11Y_WAS_ON true\nelse\n  remember A11Y_WAS_ON false\nfi\n\necho "==> Installing dependencies (asks for your password)"\nsudo apt-get update -qq || echo "!!  apt update failed (no network?); using the package lists you have"\nsudo apt-get install -y python3-pyqt6 python3-pyqt6.qtsvg fonts-noto-color-emoji wl-clipboard \\\n    python3-gi gir1.2-atspi-2.0 at-spi2-core \\\n    git curl meson ninja-build gcc pkg-config libwayland-dev libwayland-bin wayland-protocols\n\n# Plasma 6 only offers the newer "ext-data-control" clipboard protocol. Ubuntu\'s\n# wl-clipboard is too old for it, so build wl-clipboard 2.3.0 into your home folder.\n# Downloads are pinned to exact versions and checked, since this tool sees every copy.\nWLC="$HOME/.local/opt/$APP/wl-clipboard"\nWLC_COMMIT=67a7b937895bceec1ae5ccebb10216f63f70ca1b          # wl-clipboard v2.3.0\nXML_SHA256=293deba5dfdb974fbcf8dcf891a30a51a36a8bba0047dc6bdf6a03194089b7fb   # wayland-protocols 1.45\nXML="$HOME/.local/opt/$APP/ext-data-control-v1.xml"\nget_xml() {   # the clipboard protocol description, downloaded once and checked\n  if ! echo "$XML_SHA256  $XML" 2>/dev/null | sha256sum -c --quiet 2>/dev/null; then\n    mkdir -p "$(dirname "$XML")"\n    curl -fsSL -o "$XML.tmp" \\\n        https://gitlab.freedesktop.org/wayland/wayland-protocols/-/raw/1.45/staging/ext-data-control/ext-data-control-v1.xml || return 1\n    if ! echo "$XML_SHA256  $XML.tmp" | sha256sum -c --quiet; then\n      echo "!!  Protocol file checksum mismatch; not using it."; rm -f "$XML.tmp"; return 1\n    fi\n    mv "$XML.tmp" "$XML"\n  fi\n}\nbuild_wlc() {\n  local WORK; WORK=$(mktemp -d)\n  trap \'rm -rf "$WORK"\' RETURN\n  git -c advice.detachedHead=false clone -q --depth 1 --branch v2.3.0 \\\n      https://github.com/bugaevc/wl-clipboard.git "$WORK/src" || return 1\n  if [ "$(git -C "$WORK/src" rev-parse HEAD)" != "$WLC_COMMIT" ]; then\n    echo "!!  wl-clipboard download doesn\'t match the expected version; not using it."; return 1\n  fi\n  get_xml || return 1\n  cp "$XML" "$WORK/src/src/protocol/ext-data-control-v1.xml"\n  # use that bundled protocol file even if the system\'s wayland-protocols is older\n  sed -i -e "s|have_ext_data_control = wayland_protocols.found() and wayland_protocols.version().version_compare(\'>= 1.39\')|have_ext_data_control = true|" \\\n         -e "s|ext_data_control_xml = join_paths(protocols_path, \'staging\', \'ext-data-control\', \'ext-data-control-v1.xml\')|ext_data_control_xml = \'ext-data-control-v1.xml\'|" \\\n      "$WORK/src/src/protocol/meson.build"\n  meson setup "$WORK/build" "$WORK/src" --prefix="$WLC" --buildtype=release \\\n      -Dzshcompletiondir=no -Dfishcompletiondir=no >/dev/null || return 1\n  ninja -C "$WORK/build" >/dev/null || return 1\n  ninja -C "$WORK/build" install >/dev/null || return 1\n}\nif ! "$WLC/bin/wl-paste" --version 2>/dev/null | grep -q "2\\.[3-9]"; then\n  echo "==> Building wl-clipboard 2.3.0 (for clipboard history, takes ~20 seconds)"\n  if build_wlc; then\n    echo "    built: $("$WLC/bin/wl-paste" --version | head -1)"\n  else\n    echo "!!  Couldn\'t build wl-clipboard (network?). Clipboard history won\'t work until setup is re-run."\n  fi\nfi\n\n# kaomi-copy: puts several formats on the clipboard at once (wl-copy can do one),\n# so restoring your clipboard after an emoji keeps formatting. Tiny C program,\n# source written next to this by "kaomi.py --setup"; rebuilt when it changes.\nKC="$HOME/.local/opt/$APP/kaomi-copy"\nif [ -f "$KC/kaomi-copy.c" ] && [ "$(sha256sum "$KC/kaomi-copy.c" | cut -c1-64)" != "$(cat "$KC/built-from" 2>/dev/null)" ]; then\n  echo "==> Building kaomi-copy (keeps clipboard formatting)"\n  if get_xml && (\n       cd "$KC" && rm -rf build && mkdir build &&\n       wayland-scanner client-header "$XML" build/ext-data-control-v1-client-protocol.h &&\n       wayland-scanner private-code "$XML" build/ext-data-control-v1-protocol.c &&\n       gcc -O2 -Wall -Ibuild -o build/kaomi-copy kaomi-copy.c build/ext-data-control-v1-protocol.c \\\n           -lwayland-client &&\n       mkdir -p bin && install -m 755 build/kaomi-copy bin/kaomi-copy &&\n       sha256sum kaomi-copy.c | cut -c1-64 > built-from ); then\n    echo "    built"\n  else\n    echo "!!  Couldn\'t build kaomi-copy; clipboard restores will use wl-copy (plain text only)."\n  fi\nfi\n\n# Auto-insert now uses KDE\'s own permission prompt. Older versions gave every\n# program in your session access to a virtual keyboard; take that back.\nif [ -e /etc/udev/rules.d/60-win-emoji-picker-uinput.rules ] || [ -e /etc/modules-load.d/win-emoji-picker-uinput.conf ]; then\n  echo "==> Removing the old virtual-keyboard access (no longer needed)"\n  sudo rm -f /etc/udev/rules.d/60-win-emoji-picker-uinput.rules /etc/modules-load.d/win-emoji-picker-uinput.conf\n  sudo udevadm control --reload-rules || true\n  UINPUT_REMOVED=y\nfi\n\nif [ "${OLD_PLUGIN:-n}" = y ]; then\n  for d in "$(qtpaths6 --query QT_INSTALL_PLUGINS 2>/dev/null)" /usr/lib/*/qt6/plugins /usr/lib64/qt6/plugins /usr/lib/qt6/plugins; do\n    f="$d/kwin/plugins/kaomi_caret.so"\n    if [ -n "$d" ] && [ -e "$f" ]; then sudo rm -f "$f"; fi\n  done\nfi\n\necho "==> Installing the app"\nmkdir -p "$HOME/.local/bin" "$HOME/.local/share/applications" "$HOME/.config/autostart" "$HOME/.cache"\n[ "$SRC" -ef "$BIN" ] || install -m 755 "$SRC" "$BIN"      # re-running from the installed copy is fine\n\ncat > "$HOME/.local/share/applications/$APP.desktop" <<EOF\n[Desktop Entry]\nType=Application\nName=Kaomi\nGenericName=Emoji Picker\nComment=Pick an emoji and type it into the current app\nExec=$BIN\nIcon=$APP\nTerminal=false\nCategories=Utility;\nStartupNotify=false\nEOF\n\ncat > "$HOME/.local/share/applications/$APP-clipboard.desktop" <<EOF\n[Desktop Entry]\nType=Application\nName=Kaomi Clipboard\nGenericName=Clipboard History\nComment=Open Kaomi on its clipboard history tab\nExec=$BIN --clipboard\nIcon=$APP-clipboard\nTerminal=false\nCategories=Utility;\nStartupNotify=false\nEOF\n\ncat > "$HOME/.config/autostart/$APP-daemon.desktop" <<EOF\n[Desktop Entry]\nType=Application\nName=Kaomi background service\nExec=$BIN --daemon\nIcon=$APP\nNoDisplay=true\nX-KDE-autostart-phase=2\nEOF\n\necho "==> Shortcuts"\n# Plasma\'s shortcut service keeps its own copy of these settings and writes it\n# back, so it is stopped while we edit and started again afterwards.\ndeclare -a EDITS=()\nwant() {  # group subgroup key value   (queue only if different)\n  local cur; cur=$($KR --file kglobalshortcutsrc --group "$1" ${2:+--group "$2"} --key "$3")\n  [ "$cur" = "$4" ] || EDITS+=("$1|$2|$3|$4")\n}\ndrop() {  # group subgroup key   (queue a delete if it is set)\n  local cur; cur=$($KR --file kglobalshortcutsrc --group "$1" ${2:+--group "$2"} --key "$3")\n  [ -z "$cur" ] || EDITS+=("$1|$2|$3|<delete>")\n}\ndrop services "$OLD.desktop" _launch            # shortcuts of the old name\ndrop services "$OLD-clipboard.desktop" _launch\nEMOJIER=$($KR --file kglobalshortcutsrc --group services --group org.kde.plasma.emojier.desktop --key _launch)\n[ "$EMOJIER" = "Meta+Ctrl+Alt+Shift+Space" ] || remember ORIG_EMOJIER "${EMOJIER:-<default>}"\nwant services org.kde.plasma.emojier.desktop _launch "Meta+Ctrl+Alt+Shift+Space"\nwant services "$APP.desktop" _launch "Meta+."\nif [ "$USE_META_V" = y ]; then\n  for comp in plasmashell klipper; do\n    cur=$($KR --file kglobalshortcutsrc --group $comp --key show-on-mouse-pos)\n    if [ -n "$cur" ] && [ "${cur%%,*}" != "none" ]; then\n      remember "ORIG_SHOW_ON_MOUSE_$comp" "$cur"\n      want $comp "" show-on-mouse-pos "none,${cur#*,}"\n    fi\n  done\n  want services "$APP-clipboard.desktop" _launch "Meta+V"\nfi\nNEED_RELOGIN=n\nif [ ${#EDITS[@]} -gt 0 ]; then\n  KGA=plasma-kglobalaccel.service\n  HAVE_KGA=n; systemctl --user is-active --quiet $KGA 2>/dev/null && HAVE_KGA=y\n  [ $HAVE_KGA = y ] && systemctl --user stop $KGA\n  trap \'[ $HAVE_KGA = y ] && systemctl --user start $KGA\' EXIT    # even if something below fails\n  for e in "${EDITS[@]}"; do\n    IFS=\'|\' read -r g sg k v <<< "$e"\n    if [ "$v" = "<delete>" ]; then\n      $KW --file kglobalshortcutsrc --group "$g" ${sg:+--group "$sg"} --key "$k" --delete\n    else\n      $KW --file kglobalshortcutsrc --group "$g" ${sg:+--group "$sg"} --key "$k" "$v"\n    fi\n  done\n  trap - EXIT\n  if [ $HAVE_KGA = y ]; then\n    systemctl --user start $KGA\n    echo "    updated (active now)"\n  else\n    NEED_RELOGIN=y\n    echo "    updated (active after you log out and back in)"\n  fi\nelse\n  echo "    already set"\nfi\n\necho "==> Plasma\'s own clipboard (Klipper)"\n# Klipper\'s "Prevent empty clipboard" puts its own last item straight back\n# whenever the clipboard is emptied. That undid Kaomi\'s Clear all and Delete\n# (old items came back), so it is turned off. --uninstall puts it back.\nCUR=$($KR --file klipperrc --group General --key NoEmptyClipboard --default true)\nif [ "$CUR" != false ]; then\n  remember ORIG_NO_EMPTY_CLIPBOARD "$CUR"\n  $KW --file klipperrc --group General --key NoEmptyClipboard --type bool false\n  busctl --user call org.kde.klipper /klipper org.kde.klipper.klipper reloadConfig >/dev/null 2>&1 || true\n  echo "    Prevent empty clipboard: turned off (Kaomi looks after the clipboard now)"\nelse\n  echo "    already set"\nfi\n\n# Older versions used a KWin window rule; the picker now does this itself (safer:\n# a rule could be borrowed by any app using the same name). Remove it cleanly.\nRULE="$OLD-rule"\nif [ -n "$($KR --file kwinrulesrc --group "$RULE" --key wmclass)" ]; then\n  for k in Description wmclass wmclassmatch above aboverule skiptaskbar skiptaskbarrule \\\n           skippager skippagerrule skipswitcher skipswitcherrule placement placementrule; do\n    $KW --file kwinrulesrc --group "$RULE" --key $k --delete 2>/dev/null || true\n  done\n  for list in rules Order; do\n    cur=$($KR --file kwinrulesrc --group General --key $list)\n    [ -n "$cur" ] || continue\n    new=$(printf \'%s\' "$cur" | tr \',\' \'\\n\' | grep -vx "$RULE" | paste -sd, - || true)\n    $KW --file kwinrulesrc --group General --key $list "$new"\n    if [ $list = rules ]; then\n      $KW --file kwinrulesrc --group General --key count "$(printf \'%s\' "$new" | tr \',\' \'\\n\' | grep -c . || true)"\n    fi\n  done\n  for Q in qdbus6 qdbus; do\n    command -v $Q >/dev/null && { $Q org.kde.KWin /KWin reconfigure >/dev/null 2>&1 || true; break; }\n  done\nfi\n\necho "==> Text-cursor plugin for KWin (panel opens at the text cursor in every app)"\n# Installed as a root-owned system file but only switched on by the picker for\n# your session. After a Plasma update the picker shows an "Update now" notification.\nif ! ( set -o pipefail; "$BIN" --update-kwin-plugin 2>&1 | sed \'s/^/    /\' ); then\n  echo "!!  The plugin couldn\'t be built; the panel will use the older per-app method."\nfi\n\necho "==> Starting it"\n"$BIN" --quit 2>/dev/null || true                         # ask the running picker to exit\nsleep 0.5\n# older versions don\'t know --quit: stop only the picker\'s own processes\npkill -u "$(id -u)" -f -x "[^ ]*python3[^ ]* $BIN( --daemon| --clipboard)?" 2>/dev/null || true\npkill -u "$(id -u)" -f "$APP-caret-helper" 2>/dev/null || true\nsleep 0.3\n(umask 077; nohup "$BIN" --daemon >/dev/null 2>"$HOME/.cache/$APP.start.log" &)\nsleep 2\nif pgrep -u "$(id -u)" -f -x "[^ ]*python3[^ ]* $BIN --daemon" >/dev/null; then\n  echo "    running: $("$BIN" --version)"\n  case "$("$BIN" --kplug-status 2>/dev/null)" in\n    active)   echo "    KWin plugin: active" ;;\n    outdated) echo "    KWin plugin: updated; Plasma still runs the old one until you log out and back in"\n              NEED_RELOGIN=y ;;\n    *)        echo "    KWin plugin: turns on after you log out and back in" ;;\n  esac\nelse\n  echo "!!  It crashed on start. Error:"; tail -15 "$HOME/.cache/$APP.start.log" "$HOME/.cache/$APP.log" 2>/dev/null\nfi\n\necho "==> Checking clipboard access"\nif [ -n "$WAYLAND_DISPLAY" ] && [ -x "$WLC/bin/wl-paste" ]; then\n  ERR=$(timeout 2 "$WLC/bin/wl-paste" --watch true 2>&1 >/dev/null || true)\n  if echo "$ERR" | grep -qi "require\\|not support\\|protocol"; then\n    echo "!!  Clipboard history can\'t watch copies on this system: $ERR"\n  else\n    echo "    ok"\n  fi\nfi\n\necho\nif [ ! -e "$HOME/.local/share/$APP/portal-token" ]; then\n  echo "KDE will ask once to allow Kaomi to \\"control input devices\\"."\n  echo "Click Allow: that\'s how it pastes clipboard items for you. You\'ll see a short"\n  echo "\\"Remote control session started\\" notice once per login."\nfi\nif [ "${UINPUT_REMOVED:-n}" = y ]; then\n  echo "(The old virtual-keyboard access is fully gone after your next restart.)"\nfi\nif [ "$NEED_RELOGIN" = y ]; then\n  echo "Done! Log out and back in once so the new shortcuts / plugin take over."\nelse\n  echo "Done! Everything is up to date and running."\nfi\n'
-UNINSTALL_SH = '#!/usr/bin/env bash\n# Removes Kaomi: app files, shortcuts, KWin plugin, background service.\n# Run:  kaomi --uninstall\nAPP=kaomi\nBIN="$HOME/.local/bin/$APP"\n\nif [ "$(id -u)" -eq 0 ]; then\n  echo "Run this as your normal user (without sudo). It asks for your password when needed."\n  exit 1\nfi\nKW=kwriteconfig6; command -v $KW >/dev/null || KW=kwriteconfig5\nKR=kreadconfig6;  command -v $KR >/dev/null || KR=kreadconfig5\nSETUP_CONF="$HOME/.config/$APP/setup.conf"\nsaved() { sed -n "s/^$1=//p" "$SETUP_CONF" 2>/dev/null | head -1; }\n\necho "==> Stopping the picker"\n[ -x "$BIN" ] && "$BIN" --quit 2>/dev/null\nsleep 0.5\npkill -u "$(id -u)" -f -x "[^ ]*python3[^ ]* $BIN( --daemon| --clipboard)?" 2>/dev/null\npkill -u "$(id -u)" -f "$APP-caret-helper" 2>/dev/null\nfor Q in qdbus6 qdbus; do\n  command -v $Q >/dev/null && { $Q org.kde.KWin /Scripting org.kde.kwin.Scripting.unloadScript \\\n      "$APP-helper" >/dev/null 2>&1; break; }\ndone\n\necho "==> Giving the shortcuts back to Plasma"\nKGA=plasma-kglobalaccel.service\nHAVE_KGA=n; systemctl --user is-active --quiet $KGA 2>/dev/null && HAVE_KGA=y\n[ $HAVE_KGA = y ] && systemctl --user stop $KGA\nEMOJIER=$(saved ORIG_EMOJIER)\nif [ "$EMOJIER" = "<default>" ]; then\n  $KW --file kglobalshortcutsrc --group services --group org.kde.plasma.emojier.desktop --key _launch --delete\nelif [ -n "$EMOJIER" ]; then\n  $KW --file kglobalshortcutsrc --group services --group org.kde.plasma.emojier.desktop --key _launch "$EMOJIER"\nfi    # (nothing saved: setup never changed it, so leave it alone)\n$KW --file kglobalshortcutsrc --group services --group "$APP.desktop" --key _launch --delete\n$KW --file kglobalshortcutsrc --group services --group "$APP-clipboard.desktop" --key _launch --delete\nfor comp in plasmashell klipper; do\n  cur=$($KR --file kglobalshortcutsrc --group $comp --key show-on-mouse-pos)\n  orig=$(saved "ORIG_SHOW_ON_MOUSE_$comp")\n  case "$cur" in\n    none,*) $KW --file kglobalshortcutsrc --group $comp --key show-on-mouse-pos "${orig:-Meta+V,${cur#none,}}" ;;\n  esac\ndone\n[ $HAVE_KGA = y ] && systemctl --user start $KGA\n\n# Klipper\'s "Prevent empty clipboard", as it was before setup\nORIG=$(saved ORIG_NO_EMPTY_CLIPBOARD)\nif [ -n "$ORIG" ]; then\n  if [ "$ORIG" = true ]; then\n    $KW --file klipperrc --group General --key NoEmptyClipboard --delete\n  else\n    $KW --file klipperrc --group General --key NoEmptyClipboard --type bool "$ORIG"\n  fi\n  busctl --user call org.kde.klipper /klipper org.kde.klipper.klipper reloadConfig >/dev/null 2>&1\nfi\n\n# window rule used by older versions\nRULE="win-emoji-picker-rule"\nif [ -n "$($KR --file kwinrulesrc --group "$RULE" --key wmclass)" ]; then\n  for k in Description wmclass wmclassmatch above aboverule skiptaskbar skiptaskbarrule \\\n           skippager skippagerrule skipswitcher skipswitcherrule placement placementrule; do\n    $KW --file kwinrulesrc --group "$RULE" --key $k --delete 2>/dev/null\n  done\n  for list in rules Order; do\n    cur=$($KR --file kwinrulesrc --group General --key $list)\n    [ -n "$cur" ] || continue\n    new=$(printf \'%s\' "$cur" | tr \',\' \'\\n\' | grep -vx "$RULE" | paste -sd, -)\n    $KW --file kwinrulesrc --group General --key $list "$new"\n    [ $list = rules ] && $KW --file kwinrulesrc --group General --key count \\\n        "$(printf \'%s\' "$new" | tr \',\' \'\\n\' | grep -c .)"\n  done\n  for Q in qdbus6 qdbus; do\n    command -v $Q >/dev/null && { $Q org.kde.KWin /KWin reconfigure >/dev/null 2>&1; break; }\n  done\nfi\n\necho "==> Removing the KWin text-cursor plugin (asks for your password)"\nfor d in "$(qtpaths6 --query QT_INSTALL_PLUGINS 2>/dev/null)" /usr/lib/*/qt6/plugins /usr/lib64/qt6/plugins /usr/lib/qt6/plugins; do\n  f="$d/kwin/plugins/kaomi_caret.so"\n  [ -n "$d" ] && [ -e "$f" ] && sudo rm -f "$f" && echo "    removed $f"\ndone\n\nrm -f "$HOME/.local/share/$APP/portal-token"      # KDE input permission token\n\nif [ -e /etc/udev/rules.d/60-win-emoji-picker-uinput.rules ] || [ -e /etc/modules-load.d/win-emoji-picker-uinput.conf ]; then\n  echo "==> Removing the virtual keyboard permission (older versions)"\n  sudo rm -f /etc/udev/rules.d/60-win-emoji-picker-uinput.rules /etc/modules-load.d/win-emoji-picker-uinput.conf\n  sudo udevadm control --reload-rules\n  echo "    (takes full effect after a restart)"\nfi\n\necho "==> Removing app files"\nrm -f "$BIN" "$HOME/.local/share/applications/$APP.desktop" \\\n      "$HOME/.local/share/applications/$APP-clipboard.desktop" \\\n      "$HOME/.config/autostart/$APP-daemon.desktop" "$HOME/.cache/$APP".*log* \\\n      "$HOME/.local/share/icons/hicolor/scalable/apps/$APP.svg" \\\n      "$HOME/.local/share/icons/hicolor/scalable/apps/$APP-clipboard.svg"\nrm -rf "$HOME/.local/opt/$APP" "$HOME/.local/share/$APP/kwin-helper.js"\n\n# accessibility: switch it back off only if it was off before setup turned it on\nif [ "$(saved A11Y_WAS_ON)" = false ] && \\\n   ! busctl --user get-property org.a11y.Bus /org/a11y/bus org.a11y.Status ScreenReaderEnabled 2>/dev/null | grep -q true; then\n  busctl --user set-property org.a11y.Bus /org/a11y/bus org.a11y.Status IsEnabled b false 2>/dev/null\nfi\n\nKEEP=y\nif [ -t 0 ]; then\n  read -r -p "Also delete your settings and pinned clipboard items? [y/N] " ans || ans=\n  case "$ans" in [yY]*) KEEP=n ;; esac\nfi\nif [ $KEEP = n ]; then\n  rm -rf "$HOME/.config/$APP" "$HOME/.local/share/$APP"\n  echo "    settings and pinned items deleted"\nelse\n  # the "how things were before setup" notes are used up: a later setup must look again\n  sed -i \'/^ORIG_/d;/^A11Y_WAS_ON=/d\' "$SETUP_CONF" 2>/dev/null\n  echo "    kept your settings (~/.config/$APP) and pinned items (~/.local/share/$APP)"\nfi\necho\necho "Uninstalled."\n'
+SETUP_SH = '#!/usr/bin/env bash\n# Installs (or updates) Kaomi, the Windows-style emoji picker + clipboard history for KDE Plasma.\n# Run:  python3 kaomi.py --setup\n# Safe to run again any time: it just updates everything and restarts the app.\n# Remove everything again with:  kaomi --uninstall\nset -e\nAPP=kaomi\nOLD=win-emoji-picker      # the name before 1.0\nBIN="$HOME/.local/bin/$APP"\nCONF_DIR="$HOME/.config/$APP"\n\nif [ "$(id -u)" -eq 0 ]; then\n  echo "Run setup as your normal user (without sudo). It asks for your password when needed."\n  exit 1\nfi\n\nSRC="${KAOMI_SRC:?}"     # the file you ran --setup from\necho "==> Setting up Kaomi version $(grep -m1 \'^VERSION\' "$SRC" | cut -d\'"\' -f2)"\n\n# Kaomi used to be called "win-emoji-picker": stop the old one, keep your\n# settings, pins and the built clipboard tool, and remove the old files.\nif [ -e "$HOME/.local/bin/$OLD" ] || [ -d "$HOME/.config/$OLD" ] || [ -d "$HOME/.local/share/$OLD" ]; then\n  echo "==> Moving over from $OLD (the old name)"\n  timeout 3 "$HOME/.local/bin/$OLD" --quit 2>/dev/null || true\n  sleep 0.5\n  pkill -u "$(id -u)" -f -x "[^ ]*python3[^ ]* $HOME/.local/bin/$OLD( --daemon| --clipboard)?" 2>/dev/null || true\n  pkill -u "$(id -u)" -f "$OLD-caret-helper" 2>/dev/null || true\n  for Q in qdbus6 qdbus; do\n    command -v $Q >/dev/null && { $Q org.kde.KWin /Scripting org.kde.kwin.Scripting.unloadScript \\\n        "$OLD-helper" >/dev/null 2>&1 || true; break; }\n  done\n  for d in .config .local/share .local/opt; do\n    if [ -d "$HOME/$d/$OLD" ] && [ ! -e "$HOME/$d/$APP" ]; then\n      mv "$HOME/$d/$OLD" "$HOME/$d/$APP"\n    elif [ -d "$HOME/$d/$OLD" ] && [ "$d" = .local/opt ]; then\n      rm -rf "$HOME/$d/$OLD"                           # only built tools: built again below\n    elif [ -d "$HOME/$d/$OLD" ]; then\n      mv "$HOME/$d/$OLD" "$HOME/$d/$OLD.old-copy"      # already have the new one: keep aside\n    fi\n  done\n  # tied to the old name: KDE asks for the input permission once more\n  rm -f "$HOME/.local/share/$APP/portal-token" "$HOME/.local/share/$APP/kwin-helper.js" \\\n        "$HOME/.local/share/$OLD.old-copy/portal-token"\n  rm -f "$HOME/.local/bin/$OLD" "$HOME/.local/share/applications/$OLD.desktop" \\\n        "$HOME/.local/share/applications/$OLD-clipboard.desktop" "$HOME/.config/autostart/$OLD-daemon.desktop" \\\n        "$HOME/.local/share/icons/hicolor/scalable/apps/$OLD.svg" \\\n        "$HOME/.local/share/icons/hicolor/scalable/apps/$OLD-clipboard.svg" "$HOME/.cache/$OLD".*log*\n  OLD_PLUGIN=y\nfi\n\nKW=kwriteconfig6; command -v $KW >/dev/null || KW=kwriteconfig5\nKR=kreadconfig6;  command -v $KR >/dev/null || KR=kreadconfig5\n\n# Meta+V question: asked once, answer remembered; defaults to yes without a terminal\nmkdir -p "$CONF_DIR"\nUSE_META_V=$(sed -n \'s/^META_V=//p\' "$CONF_DIR/setup.conf" 2>/dev/null || true)\nif [ -z "$USE_META_V" ]; then\n  USE_META_V=y\n  if [ -t 0 ]; then\n    read -r -p "Use Meta+V for the new clipboard history (instead of Plasma\'s)? [Y/n] " ans || ans=\n    case "$ans" in [nN]*) USE_META_V=n ;; esac\n  fi\n  echo "META_V=$USE_META_V" >> "$CONF_DIR/setup.conf"\nfi\n# remember how things were before we changed them, so --uninstall can put them back\nremember() { grep -q "^$1=" "$CONF_DIR/setup.conf" 2>/dev/null || echo "$1=$2" >> "$CONF_DIR/setup.conf"; }\nif busctl --user get-property org.a11y.Bus /org/a11y/bus org.a11y.Status IsEnabled 2>/dev/null | grep -q true; then\n  remember A11Y_WAS_ON true\nelse\n  remember A11Y_WAS_ON false\nfi\n\necho "==> Installing dependencies (asks for your password)"\nsudo apt-get update -qq || echo "!!  apt update failed (no network?); using the package lists you have"\nsudo apt-get install -y python3-pyqt6 python3-pyqt6.qtsvg fonts-noto-color-emoji wl-clipboard \\\n    python3-gi gir1.2-atspi-2.0 at-spi2-core \\\n    git curl meson ninja-build gcc pkg-config libwayland-dev libwayland-bin wayland-protocols\n\n# Plasma 6 only offers the newer "ext-data-control" clipboard protocol. Ubuntu\'s\n# wl-clipboard is too old for it, so build wl-clipboard 2.3.0 into your home folder.\n# Downloads are pinned to exact versions and checked, since this tool sees every copy.\nWLC="$HOME/.local/opt/$APP/wl-clipboard"\nWLC_COMMIT=67a7b937895bceec1ae5ccebb10216f63f70ca1b          # wl-clipboard v2.3.0\nXML_SHA256=293deba5dfdb974fbcf8dcf891a30a51a36a8bba0047dc6bdf6a03194089b7fb   # wayland-protocols 1.45\nXML="$HOME/.local/opt/$APP/ext-data-control-v1.xml"\nget_xml() {   # the clipboard protocol description, downloaded once and checked\n  if ! echo "$XML_SHA256  $XML" 2>/dev/null | sha256sum -c --quiet 2>/dev/null; then\n    mkdir -p "$(dirname "$XML")"\n    curl -fsSL -o "$XML.tmp" \\\n        https://gitlab.freedesktop.org/wayland/wayland-protocols/-/raw/1.45/staging/ext-data-control/ext-data-control-v1.xml || return 1\n    if ! echo "$XML_SHA256  $XML.tmp" | sha256sum -c --quiet; then\n      echo "!!  Protocol file checksum mismatch; not using it."; rm -f "$XML.tmp"; return 1\n    fi\n    mv "$XML.tmp" "$XML"\n  fi\n}\nbuild_wlc() {\n  local WORK; WORK=$(mktemp -d)\n  trap \'rm -rf "$WORK"\' RETURN\n  git -c advice.detachedHead=false clone -q --depth 1 --branch v2.3.0 \\\n      https://github.com/bugaevc/wl-clipboard.git "$WORK/src" || return 1\n  if [ "$(git -C "$WORK/src" rev-parse HEAD)" != "$WLC_COMMIT" ]; then\n    echo "!!  wl-clipboard download doesn\'t match the expected version; not using it."; return 1\n  fi\n  get_xml || return 1\n  cp "$XML" "$WORK/src/src/protocol/ext-data-control-v1.xml"\n  # use that bundled protocol file even if the system\'s wayland-protocols is older\n  sed -i -e "s|have_ext_data_control = wayland_protocols.found() and wayland_protocols.version().version_compare(\'>= 1.39\')|have_ext_data_control = true|" \\\n         -e "s|ext_data_control_xml = join_paths(protocols_path, \'staging\', \'ext-data-control\', \'ext-data-control-v1.xml\')|ext_data_control_xml = \'ext-data-control-v1.xml\'|" \\\n      "$WORK/src/src/protocol/meson.build"\n  meson setup "$WORK/build" "$WORK/src" --prefix="$WLC" --buildtype=release \\\n      -Dzshcompletiondir=no -Dfishcompletiondir=no >/dev/null || return 1\n  ninja -C "$WORK/build" >/dev/null || return 1\n  ninja -C "$WORK/build" install >/dev/null || return 1\n}\nif ! "$WLC/bin/wl-paste" --version 2>/dev/null | grep -q "2\\.[3-9]"; then\n  echo "==> Building wl-clipboard 2.3.0 (for clipboard history, takes ~20 seconds)"\n  if build_wlc; then\n    echo "    built: $("$WLC/bin/wl-paste" --version | head -1)"\n  else\n    echo "!!  Couldn\'t build wl-clipboard (network?). Clipboard history won\'t work until setup is re-run."\n  fi\nfi\n\n# kaomi-copy: puts several formats on the clipboard at once (wl-copy can do one),\n# so restoring your clipboard after an emoji keeps formatting. Tiny C program,\n# source written next to this by "kaomi.py --setup"; rebuilt when it changes.\nKC="$HOME/.local/opt/$APP/kaomi-copy"\nif [ -f "$KC/kaomi-copy.c" ] && [ "$(sha256sum "$KC/kaomi-copy.c" | cut -c1-64)" != "$(cat "$KC/built-from" 2>/dev/null)" ]; then\n  echo "==> Building kaomi-copy (keeps clipboard formatting)"\n  if get_xml && (\n       cd "$KC" && rm -rf build && mkdir build &&\n       wayland-scanner client-header "$XML" build/ext-data-control-v1-client-protocol.h &&\n       wayland-scanner private-code "$XML" build/ext-data-control-v1-protocol.c &&\n       gcc -O2 -Wall -Ibuild -o build/kaomi-copy kaomi-copy.c build/ext-data-control-v1-protocol.c \\\n           -lwayland-client &&\n       mkdir -p bin && install -m 755 build/kaomi-copy bin/kaomi-copy &&\n       sha256sum kaomi-copy.c | cut -c1-64 > built-from ); then\n    echo "    built"\n  else\n    echo "!!  Couldn\'t build kaomi-copy; clipboard restores will use wl-copy (plain text only)."\n  fi\nfi\n\n# Auto-insert now uses KDE\'s own permission prompt. Older versions gave every\n# program in your session access to a virtual keyboard; take that back.\nif [ -e /etc/udev/rules.d/60-win-emoji-picker-uinput.rules ] || [ -e /etc/modules-load.d/win-emoji-picker-uinput.conf ]; then\n  echo "==> Removing the old virtual-keyboard access (no longer needed)"\n  sudo rm -f /etc/udev/rules.d/60-win-emoji-picker-uinput.rules /etc/modules-load.d/win-emoji-picker-uinput.conf\n  sudo udevadm control --reload-rules || true\n  UINPUT_REMOVED=y\nfi\n\nif [ "${OLD_PLUGIN:-n}" = y ]; then\n  for d in "$(qtpaths6 --query QT_INSTALL_PLUGINS 2>/dev/null)" /usr/lib/*/qt6/plugins /usr/lib64/qt6/plugins /usr/lib/qt6/plugins; do\n    f="$d/kwin/plugins/kaomi_caret.so"\n    if [ -n "$d" ] && [ -e "$f" ]; then sudo rm -f "$f"; fi\n  done\nfi\n\necho "==> Installing the app"\nmkdir -p "$HOME/.local/bin" "$HOME/.local/share/applications" "$HOME/.config/autostart" "$HOME/.cache"\n[ "$SRC" -ef "$BIN" ] || install -m 755 "$SRC" "$BIN"      # re-running from the installed copy is fine\n\ncat > "$HOME/.local/share/applications/$APP.desktop" <<EOF\n[Desktop Entry]\nType=Application\nName=Kaomi\nGenericName=Emoji Picker\nComment=Pick an emoji and type it into the current app\nExec="$BIN"\nIcon=$APP\nTerminal=false\nCategories=Utility;\nStartupNotify=false\nEOF\n\ncat > "$HOME/.local/share/applications/$APP-clipboard.desktop" <<EOF\n[Desktop Entry]\nType=Application\nName=Kaomi Clipboard\nGenericName=Clipboard History\nComment=Open Kaomi on its clipboard history tab\nExec="$BIN" --clipboard\nIcon=$APP-clipboard\nTerminal=false\nCategories=Utility;\nStartupNotify=false\nEOF\n\ncat > "$HOME/.config/autostart/$APP-daemon.desktop" <<EOF\n[Desktop Entry]\nType=Application\nName=Kaomi background service\nExec="$BIN" --daemon\nIcon=$APP\nNoDisplay=true\nX-KDE-autostart-phase=2\nEOF\n\necho "==> Shortcuts"\n# Plasma\'s shortcut service keeps its own copy of these settings and writes it\n# back, so it is stopped while we edit and started again afterwards.\ndeclare -a EDITS=()\nwant() {  # group subgroup key value   (queue only if different)\n  local cur; cur=$($KR --file kglobalshortcutsrc --group "$1" ${2:+--group "$2"} --key "$3")\n  [ "$cur" = "$4" ] || EDITS+=("$1|$2|$3|$4")\n}\ndrop() {  # group subgroup key   (queue a delete if it is set)\n  local cur; cur=$($KR --file kglobalshortcutsrc --group "$1" ${2:+--group "$2"} --key "$3")\n  [ -z "$cur" ] || EDITS+=("$1|$2|$3|<delete>")\n}\ndrop services "$OLD.desktop" _launch            # shortcuts of the old name\ndrop services "$OLD-clipboard.desktop" _launch\nEMOJIER=$($KR --file kglobalshortcutsrc --group services --group org.kde.plasma.emojier.desktop --key _launch)\n[ "$EMOJIER" = "Meta+Ctrl+Alt+Shift+Space" ] || remember ORIG_EMOJIER "${EMOJIER:-<default>}"\nwant services org.kde.plasma.emojier.desktop _launch "Meta+Ctrl+Alt+Shift+Space"\nwant services "$APP.desktop" _launch "Meta+."\nif [ "$USE_META_V" = y ]; then\n  for comp in plasmashell klipper; do\n    cur=$($KR --file kglobalshortcutsrc --group $comp --key show-on-mouse-pos)\n    if [ -n "$cur" ] && [ "${cur%%,*}" != "none" ]; then\n      remember "ORIG_SHOW_ON_MOUSE_$comp" "$cur"\n      want $comp "" show-on-mouse-pos "none,${cur#*,}"\n    fi\n  done\n  want services "$APP-clipboard.desktop" _launch "Meta+V"\nfi\nNEED_RELOGIN=n\nif [ ${#EDITS[@]} -gt 0 ]; then\n  KGA=plasma-kglobalaccel.service\n  HAVE_KGA=n; systemctl --user is-active --quiet $KGA 2>/dev/null && HAVE_KGA=y\n  [ $HAVE_KGA = y ] && systemctl --user stop $KGA\n  trap \'[ $HAVE_KGA = y ] && systemctl --user start $KGA\' EXIT    # even if something below fails\n  for e in "${EDITS[@]}"; do\n    IFS=\'|\' read -r g sg k v <<< "$e"\n    if [ "$v" = "<delete>" ]; then\n      $KW --file kglobalshortcutsrc --group "$g" ${sg:+--group "$sg"} --key "$k" --delete\n    else\n      $KW --file kglobalshortcutsrc --group "$g" ${sg:+--group "$sg"} --key "$k" "$v"\n    fi\n  done\n  trap - EXIT\n  if [ $HAVE_KGA = y ]; then\n    systemctl --user start $KGA\n    echo "    updated (active now)"\n  else\n    NEED_RELOGIN=y\n    echo "    updated (active after you log out and back in)"\n  fi\nelse\n  echo "    already set"\nfi\n\necho "==> Plasma\'s own clipboard (Klipper)"\n# Klipper\'s "Prevent empty clipboard" puts its own last item straight back\n# whenever the clipboard is emptied. That undid Kaomi\'s Clear all and Delete\n# (old items came back), so it is turned off. --uninstall puts it back.\nCUR=$($KR --file klipperrc --group General --key NoEmptyClipboard --default true)\nif [ "$CUR" != false ]; then\n  remember ORIG_NO_EMPTY_CLIPBOARD "$CUR"\n  $KW --file klipperrc --group General --key NoEmptyClipboard --type bool false\n  busctl --user call org.kde.klipper /klipper org.kde.klipper.klipper reloadConfig >/dev/null 2>&1 || true\n  echo "    Prevent empty clipboard: turned off (Kaomi looks after the clipboard now)"\nelse\n  echo "    already set"\nfi\n\n# Older versions used a KWin window rule; the picker now does this itself (safer:\n# a rule could be borrowed by any app using the same name). Remove it cleanly.\nRULE="$OLD-rule"\nif [ -n "$($KR --file kwinrulesrc --group "$RULE" --key wmclass)" ]; then\n  for k in Description wmclass wmclassmatch above aboverule skiptaskbar skiptaskbarrule \\\n           skippager skippagerrule skipswitcher skipswitcherrule placement placementrule; do\n    $KW --file kwinrulesrc --group "$RULE" --key $k --delete 2>/dev/null || true\n  done\n  for list in rules Order; do\n    cur=$($KR --file kwinrulesrc --group General --key $list)\n    [ -n "$cur" ] || continue\n    new=$(printf \'%s\' "$cur" | tr \',\' \'\\n\' | grep -vx "$RULE" | paste -sd, - || true)\n    $KW --file kwinrulesrc --group General --key $list "$new"\n    if [ $list = rules ]; then\n      $KW --file kwinrulesrc --group General --key count "$(printf \'%s\' "$new" | tr \',\' \'\\n\' | grep -c . || true)"\n    fi\n  done\n  for Q in qdbus6 qdbus; do\n    command -v $Q >/dev/null && { $Q org.kde.KWin /KWin reconfigure >/dev/null 2>&1 || true; break; }\n  done\nfi\n\necho "==> Text-cursor plugin for KWin (panel opens at the text cursor in every app)"\n# Installed as a root-owned system file but only switched on by the picker for\n# your session. After a Plasma update the picker shows an "Update now" notification.\nif ! ( set -o pipefail; "$BIN" --update-kwin-plugin 2>&1 | sed \'s/^/    /\' ); then\n  echo "!!  The plugin couldn\'t be built; the panel will use the older per-app method."\nfi\n\necho "==> Starting it"\n"$BIN" --quit 2>/dev/null || true                         # ask the running picker to exit\nsleep 0.5\n# older versions don\'t know --quit: stop only the picker\'s own processes\npkill -u "$(id -u)" -f -x "[^ ]*python3[^ ]* $BIN( --daemon| --clipboard)?" 2>/dev/null || true\npkill -u "$(id -u)" -f "$APP-caret-helper" 2>/dev/null || true\nsleep 0.3\n(umask 077; nohup "$BIN" --daemon >/dev/null 2>"$HOME/.cache/$APP.start.log" &)\nsleep 2\nif pgrep -u "$(id -u)" -f -x "[^ ]*python3[^ ]* $BIN --daemon" >/dev/null; then\n  echo "    running: $("$BIN" --version)"\n  case "$("$BIN" --kplug-status 2>/dev/null)" in\n    active)   echo "    KWin plugin: active" ;;\n    outdated) echo "    KWin plugin: updated; Plasma still runs the old one until you log out and back in"\n              NEED_RELOGIN=y ;;\n    *)        echo "    KWin plugin: turns on after you log out and back in" ;;\n  esac\nelse\n  echo "!!  It crashed on start. Error:"; tail -n 15 "$HOME/.cache/$APP.start.log" "$HOME/.cache/$APP.log" 2>/dev/null || true\nfi\n\necho "==> Checking clipboard access"\nif [ -n "$WAYLAND_DISPLAY" ] && [ -x "$WLC/bin/wl-paste" ]; then\n  ERR=$(timeout 2 "$WLC/bin/wl-paste" --watch true 2>&1 >/dev/null || true)\n  if echo "$ERR" | grep -qi "require\\|not support\\|protocol"; then\n    echo "!!  Clipboard history can\'t watch copies on this system: $ERR"\n  else\n    echo "    ok"\n  fi\nfi\n\necho\nif [ ! -e "$HOME/.local/share/$APP/portal-token" ]; then\n  echo "KDE will ask once to allow Kaomi to \\"control input devices\\"."\n  echo "Click Allow: that\'s how it pastes clipboard items for you. You\'ll see a short"\n  echo "\\"Remote control session started\\" notice once per login."\nfi\nif [ "${UINPUT_REMOVED:-n}" = y ]; then\n  echo "(The old virtual-keyboard access is fully gone after your next restart.)"\nfi\nif [ "$NEED_RELOGIN" = y ]; then\n  echo "Done! Log out and back in once so the new shortcuts / plugin take over."\nelse\n  echo "Done! Everything is up to date and running."\nfi\n'
+UNINSTALL_SH = '#!/usr/bin/env bash\n# Removes Kaomi: app files, shortcuts, KWin plugin, background service.\n# Run:  kaomi --uninstall\nAPP=kaomi\nOLD=win-emoji-picker      # the name before 1.0\nBIN="$HOME/.local/bin/$APP"\n\nif [ "$(id -u)" -eq 0 ]; then\n  echo "Run this as your normal user (without sudo). It asks for your password when needed."\n  exit 1\nfi\nKW=kwriteconfig6; command -v $KW >/dev/null || KW=kwriteconfig5\nKR=kreadconfig6;  command -v $KR >/dev/null || KR=kreadconfig5\nSETUP_CONF="$HOME/.config/$APP/setup.conf"\nsaved() { sed -n "s/^$1=//p" "$SETUP_CONF" 2>/dev/null | head -1; }\n\necho "==> Stopping the picker"\n[ -x "$BIN" ] && "$BIN" --quit 2>/dev/null\nsleep 0.5\npkill -u "$(id -u)" -f -x "[^ ]*python3[^ ]* $BIN( --daemon| --clipboard)?" 2>/dev/null\npkill -u "$(id -u)" -f "$APP-caret-helper" 2>/dev/null\nfor Q in qdbus6 qdbus; do\n  command -v $Q >/dev/null && { $Q org.kde.KWin /Scripting org.kde.kwin.Scripting.unloadScript \\\n      "$APP-helper" >/dev/null 2>&1; break; }\ndone\n\necho "==> Giving the shortcuts back to Plasma"\nKGA=plasma-kglobalaccel.service\nHAVE_KGA=n; systemctl --user is-active --quiet $KGA 2>/dev/null && HAVE_KGA=y\n[ $HAVE_KGA = y ] && systemctl --user stop $KGA\nEMOJIER=$(saved ORIG_EMOJIER)\nif [ "$EMOJIER" = "<default>" ]; then\n  $KW --file kglobalshortcutsrc --group services --group org.kde.plasma.emojier.desktop --key _launch --delete\nelif [ -n "$EMOJIER" ]; then\n  $KW --file kglobalshortcutsrc --group services --group org.kde.plasma.emojier.desktop --key _launch "$EMOJIER"\nfi    # (nothing saved: setup never changed it, so leave it alone)\n$KW --file kglobalshortcutsrc --group services --group "$APP.desktop" --key _launch --delete\n$KW --file kglobalshortcutsrc --group services --group "$APP-clipboard.desktop" --key _launch --delete\nfor comp in plasmashell klipper; do\n  [ "$(saved META_V)" = n ] && break      # setup never took Meta+V: leave Plasma\'s own setting\n  cur=$($KR --file kglobalshortcutsrc --group $comp --key show-on-mouse-pos)\n  orig=$(saved "ORIG_SHOW_ON_MOUSE_$comp")\n  case "$cur" in\n    none,*) $KW --file kglobalshortcutsrc --group $comp --key show-on-mouse-pos "${orig:-Meta+V,${cur#none,}}" ;;\n  esac\ndone\n[ $HAVE_KGA = y ] && systemctl --user start $KGA\n\n# Klipper\'s "Prevent empty clipboard", as it was before setup\nORIG=$(saved ORIG_NO_EMPTY_CLIPBOARD)\nif [ -n "$ORIG" ]; then\n  if [ "$ORIG" = true ]; then\n    $KW --file klipperrc --group General --key NoEmptyClipboard --delete\n  else\n    $KW --file klipperrc --group General --key NoEmptyClipboard --type bool "$ORIG"\n  fi\n  busctl --user call org.kde.klipper /klipper org.kde.klipper.klipper reloadConfig >/dev/null 2>&1\nfi\n\n# window rule used by older versions\nRULE="win-emoji-picker-rule"\nif [ -n "$($KR --file kwinrulesrc --group "$RULE" --key wmclass)" ]; then\n  for k in Description wmclass wmclassmatch above aboverule skiptaskbar skiptaskbarrule \\\n           skippager skippagerrule skipswitcher skipswitcherrule placement placementrule; do\n    $KW --file kwinrulesrc --group "$RULE" --key $k --delete 2>/dev/null\n  done\n  for list in rules Order; do\n    cur=$($KR --file kwinrulesrc --group General --key $list)\n    [ -n "$cur" ] || continue\n    new=$(printf \'%s\' "$cur" | tr \',\' \'\\n\' | grep -vx "$RULE" | paste -sd, -)\n    $KW --file kwinrulesrc --group General --key $list "$new"\n    [ $list = rules ] && $KW --file kwinrulesrc --group General --key count \\\n        "$(printf \'%s\' "$new" | tr \',\' \'\\n\' | grep -c .)"\n  done\n  for Q in qdbus6 qdbus; do\n    command -v $Q >/dev/null && { $Q org.kde.KWin /KWin reconfigure >/dev/null 2>&1; break; }\n  done\nfi\n\necho "==> Removing the KWin text-cursor plugin (asks for your password)"\n# unload it first: KWin would otherwise keep it (and its D-Bus API) running until logout\nbusctl --user call org.kde.KWin /Plugins org.kde.KWin.Plugins UnloadPlugin s kaomi_caret >/dev/null 2>&1 || true\nfor d in "$(qtpaths6 --query QT_INSTALL_PLUGINS 2>/dev/null)" /usr/lib/*/qt6/plugins /usr/lib64/qt6/plugins /usr/lib/qt6/plugins; do\n  f="$d/kwin/plugins/kaomi_caret.so"\n  [ -n "$d" ] && [ -e "$f" ] && sudo rm -f "$f" && echo "    removed $f"\ndone\n\nrm -f "$HOME/.local/share/$APP/portal-token"      # KDE input permission token\n\nif [ -e /etc/udev/rules.d/60-win-emoji-picker-uinput.rules ] || [ -e /etc/modules-load.d/win-emoji-picker-uinput.conf ]; then\n  echo "==> Removing the virtual keyboard permission (older versions)"\n  sudo rm -f /etc/udev/rules.d/60-win-emoji-picker-uinput.rules /etc/modules-load.d/win-emoji-picker-uinput.conf\n  sudo udevadm control --reload-rules\n  echo "    (takes full effect after a restart)"\nfi\n\necho "==> Removing app files"\nrm -f "$BIN" "$HOME/.local/share/applications/$APP.desktop" \\\n      "$HOME/.local/share/applications/$APP-clipboard.desktop" \\\n      "$HOME/.config/autostart/$APP-daemon.desktop" "$HOME/.cache/$APP".*log* \\\n      "$HOME/.local/share/icons/hicolor/scalable/apps/$APP.svg" \\\n      "$HOME/.local/share/icons/hicolor/scalable/apps/$APP-clipboard.svg"\nrm -rf "$HOME/.local/opt/$APP" "$HOME/.local/share/$APP/kwin-helper.js" "$HOME/.local/opt/$OLD.old-copy"\nrm -f "$HOME/.local/share/$OLD.old-copy/portal-token"     # from a move over from the old name\n\n# accessibility: switch it back off only if it was off before setup turned it on\nif [ "$(saved A11Y_WAS_ON)" = false ] && \\\n   ! busctl --user get-property org.a11y.Bus /org/a11y/bus org.a11y.Status ScreenReaderEnabled 2>/dev/null | grep -q true; then\n  busctl --user set-property org.a11y.Bus /org/a11y/bus org.a11y.Status IsEnabled b false 2>/dev/null\nfi\n\nKEEP=y\nif [ -t 0 ]; then\n  read -r -p "Also delete your settings and pinned clipboard items? [y/N] " ans || ans=\n  case "$ans" in [yY]*) KEEP=n ;; esac\nfi\nif [ $KEEP = n ]; then\n  rm -rf "$HOME/.config/$APP" "$HOME/.local/share/$APP" "$HOME/.config/$OLD.old-copy" "$HOME/.local/share/$OLD.old-copy"\n  echo "    settings and pinned items deleted"\nelse\n  # the "how things were before setup" notes are used up: a later setup must look again\n  sed -i \'/^ORIG_/d;/^A11Y_WAS_ON=/d\' "$SETUP_CONF" 2>/dev/null\n  echo "    kept your settings (~/.config/$APP) and pinned items (~/.local/share/$APP)"\nfi\necho\necho "Uninstalled."\n'
 ICONS = {"": '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">\n  <defs>\n    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#6A8CFF"/><stop offset="1" stop-color="#4B5FE0"/></linearGradient>\n    <linearGradient id="face" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#FFE27A"/><stop offset="1" stop-color="#FFC530"/></linearGradient>\n  </defs>\n  <rect x="4" y="4" width="56" height="56" rx="14" fill="url(#bg)"/>\n  <circle cx="32" cy="33" r="17" fill="url(#face)"/>\n  <ellipse cx="25.5" cy="29" rx="2.4" ry="3.3" fill="#3A2A1A"/>\n  <ellipse cx="38.5" cy="29" rx="2.4" ry="3.3" fill="#3A2A1A"/>\n  <path d="M23.5 37.5 Q32 46 40.5 37.5" fill="none" stroke="#3A2A1A" stroke-width="2.8" stroke-linecap="round"/>\n</svg>\n',
          "-clipboard": '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">\n  <defs>\n    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#6A8CFF"/><stop offset="1" stop-color="#4B5FE0"/></linearGradient>\n  </defs>\n  <rect x="4" y="4" width="56" height="56" rx="14" fill="url(#bg)"/>\n  <rect x="17" y="14" width="30" height="38" rx="5" fill="#F4F6FF"/>\n  <rect x="25" y="10.5" width="14" height="8" rx="3" fill="#FFC530" stroke="#4B5FE0" stroke-width="1.5"/>\n  <rect x="22.5" y="26" width="19" height="3" rx="1.5" fill="#9AA6D8"/>\n  <rect x="22.5" y="33" width="19" height="3" rx="1.5" fill="#9AA6D8"/>\n  <rect x="22.5" y="40" width="12" height="3" rx="1.5" fill="#9AA6D8"/>\n</svg>\n'}
 
@@ -295,13 +295,17 @@ def kplug_update():
     print("Installing it into", dest_dir, "(asks for your password)")
     import hashlib as _h
     with open(built, "rb") as f:
-        digest = _h.sha256(f.read()).hexdigest()
-    # root checks it installs exactly the file just built (nothing swapped in
-    # meanwhile); install next to it, then rename: never overwrite a file KWin has loaded
+        data = f.read()
+    digest = _h.sha256(data).hexdigest()
+    # root gets the bytes just built on stdin and writes them itself, into a file
+    # it creates next to the destination: it never opens a path in your home
+    # folder, so nothing can be swapped in between the check and the install.
+    # Then rename: never overwrite a file KWin has loaded.
     r = subprocess.run(["sudo", "sh", "-c",
-                        'echo "$3  $1" | sha256sum -c --quiet && '
-                        'install -m 644 -o root -g root "$1" "$2.new" && mv -f "$2.new" "$2"',
-                        "x", built, dest, digest])
+                        'set -e; t=$(mktemp "$1.new.XXXXXX"); trap \'rm -f "$t"\' EXIT; '
+                        'cat > "$t"; echo "$2  $t" | sha256sum -c --quiet; '
+                        'chmod 644 "$t"; mv -f "$t" "$1"',
+                        "x", dest, digest], input=data)
     if r.returncode != 0:
         print("Installing failed."); return 1
     with open(KPLUG_STAMP, "w") as f:
@@ -520,7 +524,7 @@ def load_conf():
     c = dict(DEFAULT_CONF)
     raw = {}
     try:
-        with open(CONF_FILE) as f:
+        with open(CONF_FILE, encoding="utf-8-sig") as f:      # -sig: a BOM from some editors
             raw = json.load(f)
         if not isinstance(raw, dict):
             raw = {}
@@ -561,13 +565,13 @@ def validate_conf(c):
         elif isinstance(default, list):
             ok = isinstance(v, list)
             if ok:
-                v = [x for x in v if isinstance(x, str)]
+                v = list(dict.fromkeys(x for x in v if isinstance(x, str)))   # no duplicates
         else:
             ok = isinstance(v, type(default))
         out[k] = v if ok else default
     for k in ("recent_kaomoji", "recent_symbols"):   # optional lists
         v = c.get(k, [])
-        out[k] = [x for x in v if isinstance(x, str)] if isinstance(v, list) else []
+        out[k] = list(dict.fromkeys(x for x in v if isinstance(x, str))) if isinstance(v, list) else []
     return out
 
 
@@ -575,11 +579,19 @@ def save_conf(c):
     try:
         os.makedirs(CONF_DIR, exist_ok=True)
         tmp = CONF_FILE + ".tmp"
-        with open(tmp, "w") as f:
+        with open(tmp, "w", encoding="utf-8") as f:
             json.dump(c, f, ensure_ascii=False, indent=1)
         os.replace(tmp, CONF_FILE)
     except Exception:
         pass
+
+
+_TONE_RE = re.compile("[\ufe0f\ufe0e\U0001F3FB-\U0001F3FF]")
+
+
+def _bare(emoji):
+    """An emoji without style marks or skin tone: a pasted 👍🏽 finds 👍."""
+    return _TONE_RE.sub("", emoji)
 
 
 def apply_tone(emoji, tone):
@@ -1522,7 +1534,9 @@ class ClipboardLender:
         self.pasted_at = None
         self.tries = 0
         self.picker.watcher.lent_at = time.monotonic()
-        if self.pending is None:   # keep the original if a restore is still pending
+        # keep the original if a restore is still pending, unless something was
+        # copied since: then that is what the clipboard should go back to
+        if self.pending is None or not self._still_ours(QClipboard.Mode.Clipboard):
             self.pending = self._what_to_restore()
         modes = [QClipboard.Mode.Clipboard]
         if self._use_primary():
@@ -1589,7 +1603,7 @@ class ClipboardLender:
             else:
                 tool, args, _ = copy_command(None, primary=True)
                 if tool and os.environ.get("WAYLAND_DISPLAY"):
-                    QProcess.startDetached(tool, args)
+                    start_detached(tool, args)
 
         # clipboard: only if nothing else has been copied since we lent it
         if not self._still_ours(QClipboard.Mode.Clipboard):
@@ -1610,36 +1624,25 @@ class ClipItem:
         self.pinned = pinned
         raw = payload.encode() if kind == "text" else payload
         self.hash = hashlib.sha1(raw).hexdigest()
-        self._thumb = None
         self._preview = None
 
     def preview(self, max_h):
-        """Small copy for the history card, made once: scaling a full screenshot
-        on every open is what makes a long history slow to show."""
+        """Small copy for the history card, made once. Only this is kept: a
+        decoded full-size image can be hundreds of MB however small its file is."""
         if self._preview is None or self._preview[0] != max_h:
-            pm = self.thumb_full()
-            if not pm.isNull() and pm.height() > max_h * 2:
-                pm = pm.scaledToHeight(max_h * 2, Qt.TransformationMode.SmoothTransformation)
-            self._preview = (max_h, pm)
+            from PyQt6.QtCore import QBuffer, QIODevice
+            from PyQt6.QtGui import QImageReader
+            data = QByteArray(self.payload)
+            buf = QBuffer(data); buf.open(QIODevice.OpenModeFlag.ReadOnly)
+            reader = QImageReader(buf)
+            size = reader.size()
+            if size.isValid() and size.height() > 0:
+                h = min(size.height(), max_h * 2)             # 2x: sharp on HiDPI screens
+                w = min(max(1, size.width() * h // size.height()), 1600)
+                reader.setScaledSize(QSize(w, h))
+            img = reader.read()
+            self._preview = (max_h, QPixmap.fromImage(img) if not img.isNull() else QPixmap())
         return self._preview[1]
-
-    def thumb_full(self):
-        if self._thumb is None:
-            pm = QPixmap()
-            pm.loadFromData(self.payload)
-            self._thumb = pm
-        return self._thumb
-
-    def thumb(self, w, h):
-        if self._thumb is None:
-            pm = QPixmap()
-            pm.loadFromData(self.payload)
-            self._thumb = pm
-        pm = self._thumb
-        if pm.isNull():
-            return pm
-        return pm.scaled(w, h, Qt.AspectRatioMode.KeepAspectRatio,
-                         Qt.TransformationMode.SmoothTransformation)
 
 
 class ClipStore(QObject):
@@ -1650,6 +1653,10 @@ class ClipStore(QObject):
         super().__init__()
         self.history = []   # newest first, unpinned
         self.pinned = []    # saved to disk, shown first
+        # image files this program knows are pins (loaded or written): only these
+        # are removed once unpinned. Anything else in the folder (say, images an
+        # unreadable pinned.json lists) is never deleted.
+        self.known_files = set()
         self.load_pinned()
 
     def items(self):
@@ -1661,9 +1668,8 @@ class ClipStore(QObject):
         for p in self.pinned:
             if p.hash == it.hash:
                 return p
-        old = next((h for h in self.history if h.hash == it.hash), None)
-        if old is not None and not it.html and old.html:
-            it.html = old.html            # same text again without formatting: keep it
+        # (no carrying over formatting from an older copy of the same text: that
+        # HTML came from somewhere else, and could say something else entirely)
         self.history = [h for h in self.history if h.hash != it.hash]
         self.history.insert(0, it)
         self._trim()
@@ -1691,6 +1697,7 @@ class ClipStore(QObject):
             self.save_pinned()
         else:
             self.history = [h for h in self.history if h.id != it.id]
+        _WRAP_CACHE.clear()                     # it holds the start of deleted text
         self.changed.emit()
 
     def pin(self, it):
@@ -1716,14 +1723,25 @@ class ClipStore(QObject):
 
     def clear(self):
         self.history = []
+        _WRAP_CACHE.clear()
         self.changed.emit()
 
     # -- storage (pinned only)
     def load_pinned(self):
+        path = os.path.join(PIN_DIR, "pinned.json")
         try:
-            with open(os.path.join(PIN_DIR, "pinned.json")) as f:
+            with open(path, encoding="utf-8") as f:
                 meta = json.load(f)
-        except Exception:
+        except FileNotFoundError:
+            return
+        except Exception as ex:
+            # its images are kept (they aren't known files), and so is the list itself
+            try:
+                os.replace(path, path + ".unreadable")   # kept for recovery, not overwritten
+            except OSError:
+                pass
+            log(f"pinned items: couldn't read {path} ({ex.__class__.__name__}); "
+                "kept it as pinned.json.unreadable, with the images")
             return
         if not isinstance(meta, list):
             return
@@ -1733,12 +1751,20 @@ class ClipStore(QObject):
             try:
                 if not re.fullmatch(r"[0-9a-f]{32}", str(m["id"])):
                     continue                     # ids are only ever uuid hex; anything else is tampering
+                html, mime = m.get("html"), m["mime"]
+                if not isinstance(mime, str) or not (html is None or isinstance(html, str)):
+                    continue
                 if m["kind"] == "text":
                     payload = m["text"]
-                else:
+                    if not isinstance(payload, str):
+                        continue
+                elif m["kind"] == "image":
                     with open(os.path.join(PIN_DIR, m["id"] + ".img"), "rb") as f:
                         payload = f.read()
-                self.pinned.append(ClipItem(m["kind"], payload, m["mime"], True, m["id"], m.get("html")))
+                    self.known_files.add(m["id"] + ".img")
+                else:
+                    continue
+                self.pinned.append(ClipItem(m["kind"], payload, mime, True, m["id"], html))
             except Exception:
                 pass
 
@@ -1757,22 +1783,38 @@ class ClipStore(QObject):
                     m["file"] = it.id + ".img"
                     keep.add(m["file"])
                     path = os.path.join(PIN_DIR, m["file"])
-                    if not os.path.exists(path):
-                        with os.fdopen(os.open(path, os.O_WRONLY | os.O_CREAT, 0o600), "wb") as f:
-                            f.write(it.payload)
-                meta.append(m)
-            tmp = os.path.join(PIN_DIR, "pinned.json.tmp")
-            with open(tmp, "w") as f:
-                json.dump(meta, f, ensure_ascii=False)
-            os.replace(tmp, os.path.join(PIN_DIR, "pinned.json"))
-            for name in os.listdir(PIN_DIR):   # unpinned/deleted images are removed from disk
-                if name not in keep:
                     try:
-                        os.remove(os.path.join(PIN_DIR, name))
+                        ok = os.path.getsize(path) == len(it.payload)
                     except OSError:
-                        pass
-        except Exception:
-            pass
+                        ok = False
+                    if not ok:                   # missing, or cut short by a crash: (re)write it
+                        self._write_new(path, lambda f, b=it.payload: f.write(b))
+                    self.known_files.add(m["file"])
+                meta.append(m)
+            self._write_new(os.path.join(PIN_DIR, "pinned.json"),
+                            lambda f: f.write(json.dumps(meta, ensure_ascii=False).encode("utf-8")))
+            # unpinned/deleted images are removed from disk (and half-written leftovers)
+            gone = (self.known_files - keep) | {n for n in os.listdir(PIN_DIR) if n.endswith(".tmp")}
+            for name in gone:
+                try:
+                    os.remove(os.path.join(PIN_DIR, name))
+                    self.known_files.discard(name)
+                except FileNotFoundError:
+                    self.known_files.discard(name)
+                except OSError:
+                    pass                         # tried again on the next save
+        except Exception as ex:
+            log(f"pinned items: couldn't save ({ex})")
+
+    @staticmethod
+    def _write_new(path, write):
+        """Write a file whole or not at all: a crash or full disk mid-write can't
+        leave a truncated pin behind."""
+        tmp = path + ".tmp"
+        with os.fdopen(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "wb") as f:
+            write(f)
+            f.flush(); os.fsync(f.fileno())
+        os.replace(tmp, path)
 
 
 # The installer builds a newer wl-clipboard here: Plasma 6 only offers the newer
@@ -1819,6 +1861,15 @@ def snap_records(snap):
         else:
             add(mime, data)
     return out
+
+
+def start_detached(tool, args):
+    """Run a helper on its own, reading nothing: with QProcess.startDetached it
+    would share the picker's stdin (a terminal, when started from one)."""
+    p = QProcess()
+    p.setProgram(tool); p.setArguments(args)
+    p.setStandardInputFile(QProcess.nullDevice())
+    p.startDetached()
 
 
 def copy_command(snap, primary=False):
@@ -1892,6 +1943,8 @@ class ClipWatcher(QObject):
                 self.x11 = True
 
     def _stderr(self):
+        if self.proc is None:
+            return
         msg = bytes(self.proc.readAllStandardError()).decode(errors="ignore").strip()
         if msg:
             log("wl-paste: " + msg)
@@ -1911,10 +1964,19 @@ class ClipWatcher(QObject):
 
     def stop(self):
         self.restart_timer.stop()
+        self.timer.stop()
+        self.epoch += 1                  # a copy being read right now is not recorded either
+        self.busy = self.pending = False
         if self.proc:
             p = self.proc; self.proc = None
-            p.finished.disconnect(); p.kill()
+            for sig in (p.finished, p.readyReadStandardOutput, p.readyReadStandardError, p.errorOccurred):
+                try:
+                    sig.disconnect()     # waitForFinished below may still emit them
+                except TypeError:
+                    pass                 # nothing connected
+            p.kill()
             p.waitForFinished(500)
+            p.deleteLater()
         if self.x11:
             try:
                 QGuiApplication.clipboard().dataChanged.disconnect(self._qt_changed)
@@ -1945,6 +2007,9 @@ class ClipWatcher(QObject):
         return self.busy or self.pending or self.timer.isActive()
 
     def _changed(self):
+        if self.proc is None:
+            return
+        self.error = None                # it works (again): no stale "wl-paste says" message
         self.proc.readAllStandardOutput()
         self.timer.start()
 
@@ -1959,7 +2024,7 @@ class ClipWatcher(QObject):
             if state["fin"]:
                 return
             state["fin"] = True
-            out = bytes(p.readAllStandardOutput()) if code == 0 else None
+            out = bytes(p.readAllStandardOutput()) if code == 0 and not state.get("big") else None
             p.deleteLater()
             done(out)
 
@@ -1973,6 +2038,14 @@ class ClipWatcher(QObject):
                     finished(-1)
                 else:
                     p.kill()
+
+        def too_big():
+            # stop reading what could never be kept anyway, instead of buffering
+            # whatever an app offers (it could be endless)
+            if not state["fin"] and p.bytesAvailable() > CLIP_RESTORE_MAX:
+                state["big"] = True
+                p.kill()
+        p.readyReadStandardOutput.connect(too_big)
         p.finished.connect(finished)
         p.errorOccurred.connect(error)
         p.start(self.wl_paste, args)
@@ -2050,16 +2123,20 @@ class ClipWatcher(QObject):
         got = {}
         starts = []
 
-        def commit():
+        def commit(lent_since=False):
             if epoch != self.epoch:
                 return finish()                # read started before a delete / Clear all
+            if wayland and not lent_since and (self.pending or self.timer.isActive()):
+                # the clipboard changed while it was being read: these pieces may come
+                # from two different copies. The queued read gets the new one whole.
+                return finish()
             text = got.get(text_t) if text_t else None
             html = got.get("text/html")
             img = got.get(img_t) if (img_t and not text_t) else None
             uri = got.get(uri_t) if uri_t else None
             main = text if text is not None else img if img is not None else uri
-            if self.expect is not None and time.monotonic() < self.expect[1] and main is not None \
-                    and hashlib.sha1(main).hexdigest() == self.expect[0]:
+            if self.expect is not None and time.monotonic() < self.expect[1] and any(
+                    d is not None and hashlib.sha1(d).hexdigest() == self.expect[0] for d in (main, uri)):
                 self.expect = None             # echo of the picker's own write (via wl-copy)
                 return finish()
             snap = None
@@ -2095,11 +2172,16 @@ class ClipWatcher(QObject):
                         # our own emoji was lent while reading: the data is the user's
                         # copy only if every read started before that
                         if starts and max(starts) < self.lent_at:
-                            return commit()
+                            return commit(lent_since=True)
                         self.current = None
                         return finish()
                     if SECRET_HINT in tl2 or not tl2:
                         self.current = None          # a password arrived mid-read: drop it
+                        return finish()
+                    if tl2 != types:
+                        # a different copy now (maybe one in between was a password):
+                        # keep none of what was read, read the new one from scratch
+                        self.pending = True
                         return finish()
                     commit()
                 return self._async(["--list-types"], recheck)
@@ -2121,10 +2203,15 @@ def _glued(word, i):
     if i <= 0 or i >= len(word):
         return False
     a, b = word[i - 1], word[i]
-    return (a == "\u200d" or b in "\u200d\ufe0f\ufe0e\u20e3" or "\U0001F3FB" <= b <= "\U0001F3FF"
-            or ("\U000E0020" <= b <= "\U000E007F")
-            or ("\U0001F1E6" <= a <= "\U0001F1FF" and "\U0001F1E6" <= b <= "\U0001F1FF"
-                and sum(1 for c in word[:i] if "\U0001F1E6" <= c <= "\U0001F1FF") % 2 == 1))
+    if a == "\u200d" or b in "\u200d\ufe0f\ufe0e\u20e3" or "\U0001F3FB" <= b <= "\U0001F3FF" \
+            or "\U000E0020" <= b <= "\U000E007F":
+        return True
+    if "\U0001F1E6" <= a <= "\U0001F1FF" and "\U0001F1E6" <= b <= "\U0001F1FF":
+        run = 0                          # flags pair up within one run of letters, not the word
+        while run < i and "\U0001F1E6" <= word[i - 1 - run] <= "\U0001F1FF":
+            run += 1
+        return run % 2 == 1
+    return False
 
 
 def _safe_cut(text, n):
@@ -2140,7 +2227,9 @@ def wrap_lines(text, fm, width, max_lines):
     """Word-wrap text to at most max_lines lines at this pixel width, ending with … if cut.
     Only ever measures short pieces (emoji are slow to measure) and never splits
     a single character/emoji sequence in two."""
-    key = (text[:600], len(text), width, max_lines, fm.height(), fm.averageCharWidth())
+    # hash, not the text itself: two long items starting alike must not share a
+    # preview, and the cache shouldn't hold copies of clipboard text
+    key = (hash(text), len(text), width, max_lines, fm.height(), fm.averageCharWidth())
     hit = _WRAP_CACHE.get(key)
     if hit is not None:
         return hit
@@ -2186,8 +2275,9 @@ def wrap_lines(text, fm, width, max_lines):
         return lo
 
     lines = []
-    capped = _safe_cut(text, budget * 2)
-    truncated = len(capped) < len(text)          # anything cut off must end with …
+    flat = text.replace("\r\n", "\n").replace("\r", "\n")      # Windows line ends
+    capped = _safe_cut(flat, budget * 2)
+    truncated = len(capped) < len(flat)          # anything cut off must end with …
     paras = capped.replace("\t", "    ").strip("\n").splitlines()[:max_lines + 1] or [""]
     for pi, para in enumerate(paras):
         if len(para) > budget:
@@ -2395,6 +2485,7 @@ class ClipboardPage(QWidget):
         self.picker, self.store = picker, store
         self.cards = []
         self.items = []
+        self.keep_id = None
         self.row_h = 80
         self.sel = 0
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
@@ -2425,6 +2516,11 @@ class ClipboardPage(QWidget):
         if self.isVisible():
             self.rebuild()
         else:
+            # but don't keep rows (and what they show) of deleted or cleared items
+            # around until the next open
+            self.keep_id = self._sel_id()
+            self._drop_rows()
+            self.items = []
             self.dirty = True
 
     def showEvent(self, ev):
@@ -2432,14 +2528,23 @@ class ClipboardPage(QWidget):
             self.rebuild()
         super().showEvent(ev)
 
-    def rebuild(self):
-        self.dirty = False
-        keep = self.cards[self.sel].it.id if 0 <= self.sel < len(self.cards) else None
+    def _sel_id(self):
+        return self.cards[self.sel].it.id if 0 <= self.sel < len(self.cards) else self.keep_id
+
+    def _drop_rows(self):
         while self.list.count():
             w = self.list.takeAt(0).widget()
             if w:
                 w.hide(); w.setParent(None); w.deleteLater()
         self.cards = []
+
+    def rebuild(self, fresh=False):
+        """fresh: opening the list (at the top). Otherwise the list changed while
+        you look at it: build as many rows again, or the view jumps up."""
+        self.dirty = False
+        keep = self._sel_id()
+        built = 0 if fresh else len(self.cards)
+        self._drop_rows()
         items = self.store.items()
         if not items:
             msg = self.picker.clip_status_message()
@@ -2455,10 +2560,12 @@ class ClipboardPage(QWidget):
         if keep in ids:
             self.sel = ids.index(keep)             # same item stays selected after reordering
         self.sel = min(self.sel, len(items) - 1) if items else 0
+        self.keep_id = None
         # building every row up front made a long history slow to open: build
         # one screenful (and up to the selected item), the rest as you scroll
-        self._more(max(self.BATCH, self.sel + 1))
+        self._more(max(self.BATCH, self.sel + 1, built))
         self.select(self.sel, scroll=False)
+        self._fill_later()
 
     def _more(self, upto):
         """Build rows until there are `upto` of them (or no more items)."""
@@ -2468,24 +2575,39 @@ class ClipboardPage(QWidget):
             self.cards.append(c)
             self.list.insertWidget(self.list.count() - 1, c)     # above the stretch
 
+    def _fill_later(self):
+        # once the new rows are laid out: still no scrollbar (a tall panel) or
+        # still near the end? Then build more; the scrollbar won't say so itself
+        QTimer.singleShot(0, self._near_end)
+
     def _near_end(self, *_):
-        if len(self.cards) >= len(self.items):
+        if len(self.cards) >= len(self.items) or not self.isVisible():
             return
         sb = self.scroll.verticalScrollBar()
         if sb.maximum() - sb.value() < 3 * (self.row_h + 8):
             self._more(len(self.cards) + self.BATCH)
+            self._fill_later()
+
+    def resizeEvent(self, ev):
+        super().resizeEvent(ev)
+        self._fill_later()
 
     def select(self, i, scroll=True):
         if not self.cards:
             return
-        if i >= len(self.cards):
+        added = i >= len(self.cards)
+        if added:
             self._more(i + self.BATCH)             # arrowing past the built rows
         i = max(0, min(i, len(self.cards) - 1))
         for k, c in enumerate(self.cards):
             c.set_selected(k == i and self.hasFocus())
         self.sel = i
         if scroll:
-            self.scroll.ensureWidgetVisible(self.cards[i], 0, 8)
+            if added:                              # new rows have no place yet: after layout
+                row = self.cards[i]
+                QTimer.singleShot(0, lambda: row in self.cards and self.scroll.ensureWidgetVisible(row, 0, 8))
+            else:
+                self.scroll.ensureWidgetVisible(self.cards[i], 0, 8)
 
     def focusInEvent(self, ev):
         self.select(self.sel, scroll=False); super().focusInEvent(ev)
@@ -2866,7 +2988,9 @@ class TextGrid(QWidget):
 
     def _info(self, i):
         if self.info is not None:
-            self.info.setText(self.pos[i][1][1] if 0 <= i < len(self.pos) else "")
+            name = self.pos[i][1][1] if 0 <= i < len(self.pos) else ""
+            self.info.setText(self.info.fontMetrics().elidedText(
+                name, Qt.TextElideMode.ElideRight, max(80, self.info.contentsRect().width())))
 
     def mouseMoveEvent(self, ev):
         i = self.item_at(ev.position())
@@ -2971,6 +3095,8 @@ class TextPage(QWidget):
         self.scroll.verticalScrollBar().valueChanged.connect(self.sync_chip)
         lay.addWidget(self.scroll, 1)
         self.info = QLabel(); self.info.setContentsMargins(6, 0, 6, 0)
+        # a long symbol name must not widen the whole panel (for good)
+        self.info.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         lay.addWidget(self.info)
         self.grid.info = self.info
         self.grid.on_pick = lambda text, via: picker.pick_text(text, via, key)
@@ -3203,17 +3329,19 @@ class Picker(QWidget):
         self._wl_timer.timeout.connect(self._wl_flush)
         self.pending_text = ""
         self._own_hide = False   # the panel hid itself for a moment to paste
+        self.open_count = 0      # times you opened it: a pick from before a close+reopen is dropped
         self.passive = False     # panel open, but your app keeps keyboard focus
         self.p_jobs = []         # mouse picks waiting to be pasted, in order
         self.p_running = False
         self.p_front_after = False
         self.cycling = False
         self.last_pick = 0.0
-        self.cycle_text, self.cycle_gen = "", -1
+        self.cycle_text, self.cycle_gen, self.cycle_open = "", -1, 0
         self.mode = "emoji"
         self.shown_at = 0.0
         self.store = ClipStore()
         self.watcher = ClipWatcher(self.store)
+        self._wipe_keep = None   # what a delete still in progress will put back on the clipboard
         if self.conf["clipboard_history"]:
             self.watcher.start()
 
@@ -3306,6 +3434,7 @@ class Picker(QWidget):
         self.prev = QLabel(); pf = QFont(EMOJI_FONT); pf.setPixelSize(24); self.prev.setFont(pf)
         self.prev.setFixedWidth(36)
         self.info = QLabel()
+        self.info.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)   # never widens the panel
         foot.addWidget(self.prev); foot.addWidget(self.info, 1)
         ml.addLayout(foot)
 
@@ -3399,9 +3528,9 @@ class Picker(QWidget):
             self.stack.setCurrentWidget(page)
             page.refresh()
         else:
+            self.clip_page.sel, self.clip_page.keep_id = 0, None   # opens at the top: one batch
+            self.clip_page.rebuild(fresh=True)
             self.stack.setCurrentWidget(self.clip_page)
-            self.clip_page.rebuild()
-            self.clip_page.sel = 0
             self.clip_page.select(0)
         self._focus_current()
 
@@ -3447,9 +3576,9 @@ class Picker(QWidget):
         if q:
             words = q.split()
             hits = []
-            qs = self.search.text().strip().replace("\ufe0f", "")
+            qs = _bare(self.search.text().strip())
             for it, hay in self.search_index:
-                if it[0].replace("\ufe0f", "") == qs:          # typed/pasted the emoji itself
+                if _bare(it[0]) == qs:                       # typed/pasted the emoji itself
                     hits.append(((-1, 0), it))
                     continue
                 if all(w in hay for w in words):
@@ -3509,16 +3638,42 @@ class Picker(QWidget):
             return
         self.prev.setText(d[0])
         fm = QFontMetrics(self.info.font())
-        self.info.setText(fm.elidedText(d[1][:1].upper() + d[1][1:], Qt.TextElideMode.ElideRight,
-                                        max(80, self.info.width() - 4)))
+        # (before the first show the label still has Qt's default width: use the panel's)
+        w = min(self.info.width(), self.width() - self.prev.width() - 24) - 4
+        self.info.setText(fm.elidedText(d[1][:1].upper() + d[1][1:], Qt.TextElideMode.ElideRight, max(80, w)))
+
+    def _grid_key(self, i):
+        """(section, base emoji) of grid item i: survives a refresh, unlike i."""
+        n = 0
+        for k, (_, items) in enumerate(self.grid.sections):
+            if i < n + len(items):
+                return k, items[i - n][2][0]
+            n += len(items)
+        return None
+
+    def _grid_find(self, key):
+        n, anywhere = 0, None
+        for k, (_, items) in enumerate(self.grid.sections):
+            for j, d in enumerate(items):
+                if d[2][0] == key[1]:
+                    if k == key[0]:
+                        return n + j
+                    if anywhere is None:
+                        anywhere = n + j
+            n += len(items)
+        return anywhere
 
     def set_tone(self, k):
         self.conf["skin_tone"] = k; save_conf(self.conf)
         self.update_tone_btn()
         v = self.scroll.verticalScrollBar().value()
-        sel = self.grid.sel
-        self.refresh()
-        self.grid.sel = sel; self.scroll.verticalScrollBar().setValue(v)
+        key = self._grid_key(self.grid.sel)
+        self.refresh()                   # (recents may have changed meanwhile: indexes shift)
+        i = self._grid_find(key) if key else None
+        if i is not None:
+            self.grid.sel = i
+            self.show_info(self.grid.pos[i][1]); self.grid.update()
+        self.scroll.verticalScrollBar().setValue(v)
         self.search.setFocus()
 
     def update_tone_btn(self):
@@ -3543,6 +3698,7 @@ class Picker(QWidget):
             self.watcher.start()
         else:
             self.watcher.stop()
+            self._wipe_keep = None
             self.store.clear()
 
     # ---- picking
@@ -3624,12 +3780,12 @@ class Picker(QWidget):
             return
         text, self.pending_text = self.pending_text, ""
         self.cycle_typed = self._stage(text)
-        self.cycle_text, self.cycle_gen = text, self.clip.gen
+        self.cycle_text, self.cycle_gen, self.cycle_open = text, self.clip.gen, self.open_count
         self.signal_kwin("back")                               # focus the app you're typing in
         QTimer.singleShot(int(self.conf["paste_delay_ms"]), lambda: self._cycle_paste(0))
 
     def _cycle_paste(self, tries):
-        if not self.isVisible() and not self._own_hide:
+        if (not self.isVisible() and not self._own_hide) or self.open_count != self.cycle_open:
             # you closed the panel mid-cycle (Escape, Meta+., a click elsewhere):
             # don't type into whatever has focus now; give the clipboard back
             self.cycling = self.busy = False
@@ -3721,17 +3877,17 @@ class Picker(QWidget):
             cb = QGuiApplication.clipboard()
             if it.kind == "text" and cb.supportsSelection() and self.conf["paste_keys"] == "shift+insert":
                 cb.setText(it.payload, QClipboard.Mode.Selection)
-        gen = self.clip.gen
-        QTimer.singleShot(int(self.conf["paste_delay_ms"]), lambda: self._p_paste(job, gen, 0, typed))
+        gen, opened = self.clip.gen, self.open_count
+        QTimer.singleShot(int(self.conf["paste_delay_ms"]), lambda: self._p_paste(job, gen, 0, typed, opened))
 
-    def _p_paste(self, job, gen, waited, typed=None):
-        if not self.isVisible():
+    def _p_paste(self, job, gen, waited, typed=None, opened=None):
+        if not self.isVisible() or opened != self.open_count:
             self.p_jobs, self.p_running = [], False
-            self.clip.restore(gen)               # you closed the panel: don't type anywhere
+            self.clip.restore(gen)               # you closed the panel (maybe reopened): don't type anywhere
             return
         if self.isActiveWindow():
             if self.passive and waited < 300:
-                QTimer.singleShot(15, lambda: self._p_paste(job, gen, waited + 15, typed))
+                QTimer.singleShot(15, lambda: self._p_paste(job, gen, waited + 15, typed, opened))
                 return
             self.p_jobs.insert(0, job)
             self._p_fallback()
@@ -3742,25 +3898,40 @@ class Picker(QWidget):
             return
         self._send_paste(self.conf["paste_keys"], lambda: self._p_wait(job, gen, 0), typed)
 
-    def _p_fallback(self):
+    def _p_fallback(self, jobs=None, opened=None, waited=0):
         """KWin didn't give focus back to your app: hide for a moment, paste, return
-        (never type into the panel's own search box)."""
-        jobs, self.p_jobs, self.p_running, self.p_front_after = self.p_jobs, [], False, False
-        log("focus stayed on the picker; using hide/paste/return instead")
+        (never type into the panel's own search box). Every queued pick goes in, in
+        order: a run of emoji together, each clipboard item on its own."""
+        if jobs is None:
+            jobs, self.p_jobs, self.p_running, self.p_front_after = self.p_jobs, [], False, False
+            log("focus stayed on the picker; using hide/paste/return instead")
+            opened = self.open_count
+        elif self._own_hide and opened == self.open_count and waited < 3000:
+            # the previous one is still going in (the panel comes back after it)
+            QTimer.singleShot(100, lambda: self._p_fallback(jobs, opened, waited + 100))
+            return
+        elif opened != self.open_count or not self.isVisible() or self._own_hide:
+            log(f"insert: {len(jobs)} queued pick(s) dropped (the panel was closed)")
+            return
         if self.passive:
             self.passive = False
             self.kplug.set_passive(False)        # the plugin stops taking clicks on the panel
-        text = "".join(j[1] for j in jobs if j[0] == "text")
-        typed = None
-        if text:
-            typed = self._stage(text)
-        elif jobs:
-            _, it, plain = jobs[-1]
+        if not jobs:
+            return
+        if jobs[0][0] == "text":
+            n = next((i for i, j in enumerate(jobs) if j[0] != "text"), len(jobs))
+            typed = self._stage("".join(j[1] for j in jobs[:n]))
+        else:
+            n = 1
+            _, it, plain = jobs[0]
             self.clip.cancel()
             self.write_clipboard(snap_of_item(it, plain))
-        else:
-            return
+            typed = None
         self._hide_paste_return(self.conf, typed)
+        rest = jobs[n:]
+        if rest:                                 # once the panel is back
+            QTimer.singleShot(int(self.conf["paste_delay_ms"]) + 450,
+                              lambda: self._p_fallback(rest, opened))
 
     def _p_wait(self, job, gen, waited):
         # text: wait until the app has read the emoji; clipboard items: short pause
@@ -3946,8 +4117,13 @@ class Picker(QWidget):
         log("clipboard: handed over to " + os.path.basename(tool) + " before quitting")
 
     # ---- deleting from clipboard history also updates the real clipboard (like Windows)
+    def _clipboard_now(self):
+        """What is on the clipboard, as far as the picker knows. While a delete is
+        still emptying it, that is what the delete will put back afterwards."""
+        return self.watcher.current if self.watcher.current is not None else self._wipe_keep
+
     def _is_on_clipboard(self, it):
-        cur = self.watcher.current
+        cur = self._clipboard_now()
         if cur is None:
             return False
         if snap_hash(cur) == it.hash or any(hashlib.sha1(d).hexdigest() == it.hash for _, d in cur.extra):
@@ -3971,32 +4147,39 @@ class Picker(QWidget):
         def after():
             # only if nothing else happened meanwhile (another delete / Clear all /
             # a copy / an emoji pick): then the clipboard is still the empty one we made
-            if then and self.watcher.epoch == epoch and self.watcher.current is None:
+            if self.watcher.epoch != epoch:
+                return                           # a newer delete / Clear all takes over
+            if then and self.watcher.current is None:
                 then()
+            else:
+                self._wipe_keep = None           # something new is on the clipboard
 
-        def fallback():
+        def fallback(why="Klipper not reachable"):
             cb = QGuiApplication.clipboard()
             tool = kaomi_copy() or wlc("wl-copy")
             if self.clip._can_set_directly():
                 cb.clear(QClipboard.Mode.Clipboard)
                 if cb.supportsSelection():
                     cb.clear(QClipboard.Mode.Selection)
-                log("clipboard: emptied (Klipper not reachable)")
+                log(f"clipboard: emptied ({why})")
                 after()
             elif tool and os.environ.get("WAYLAND_DISPLAY"):
                 t2, a2, _ = copy_command(None, primary=True)
-                QProcess.startDetached(t2, a2)
+                start_detached(t2, a2)
                 t1, a1, _ = copy_command(None)
                 proc = QProcess(self)
                 proc.finished.connect(lambda *_: (proc.deleteLater(), after()))
                 proc.start(t1, a1); proc.closeWriteChannel()   # `after` once it has really cleared
-                log("clipboard: emptied with wl-copy (Klipper not reachable)")
+                log(f"clipboard: emptied with wl-copy ({why})")
             else:
                 after()
 
         def ok():
-            log("clipboard: Klipper wiped its history and emptied the clipboard")
-            after()
+            log("clipboard: Klipper wiped its history")
+            # Klipper before Plasma 6.6 only empties the clipboard when its own list
+            # wasn't empty already, and it ignores images by default: a copied
+            # screenshot would stay on the clipboard. Empty it here as well.
+            fallback("after Klipper")
 
         def err(message):
             log("clipboard: Klipper didn't answer (" + message + ")")
@@ -4018,16 +4201,31 @@ class Picker(QWidget):
         """Remove an item for good: from this list, from Plasma's own history, and
         from the clipboard if it is what's there right now (which then stays empty).
         Any other item that was on the clipboard is put back afterwards."""
+        if it not in self.store.items():
+            return                               # already gone (a second click on a stale row)
+        if not self.watcher.active():
+            # history is off: the picker doesn't know what is on the clipboard now,
+            # so it can't put it back. Leave the clipboard (and Plasma's list) alone.
+            self.store.delete(it)
+            log("clipboard: deleted a pinned item (history off: clipboard left as is)")
+            return
         was_current = self._is_on_clipboard(it)
-        keep = None if was_current else self.watcher.current
+        keep = None if was_current else self._clipboard_now()
         self.store.delete(it)
-        self._wipe_everywhere(then=(lambda: self.write_clipboard(keep)) if keep is not None else None)
+        self._wipe_keep = keep
+
+        def put_back():
+            self._wipe_keep = None
+            if keep is not None:
+                self.write_clipboard(keep)
+        self._wipe_everywhere(then=put_back)
         log(f"clipboard: deleted an item (was on clipboard: {was_current})")
 
     def clear_clip_history(self):
         """Clear all: this list, Plasma's history and the clipboard are all emptied.
         (Pinned items stay pinned.) Anything you copy after this shows up normally."""
         self.store.clear()
+        self._wipe_keep = None
         self._wipe_everywhere()
         log("clipboard: cleared history")
 
@@ -4063,18 +4261,32 @@ class Picker(QWidget):
         c = self.conf
         close = c["close_on_" + via]
         delay = int(c["paste_delay_ms"])
+        opened = self.open_count
         if close:
             self.hide()
-            QTimer.singleShot(delay, lambda: self._send_paste(c["paste_keys"], None, typed))
+            QTimer.singleShot(delay, lambda: self._same_open(opened)
+                              and self._send_paste(c["paste_keys"], None, typed))
             return
         self.busy = True
         if self.kwin_ok:
             self.signal_kwin("back")                       # ask KWin to focus the previous app
-            QTimer.singleShot(delay, lambda: self._paste_if_away(c, typed))
+            QTimer.singleShot(delay, lambda: self._paste_if_away(c, typed, opened))
         else:
             self._hide_paste_return(c, typed)
 
-    def _paste_if_away(self, c, typed=None):
+    def _same_open(self, opened):
+        """False (and the pick is dropped) if the panel was closed and opened
+        again before a pick from the earlier opening went in: the app it was meant
+        for may not have focus any more, and the panel itself might."""
+        if opened == self.open_count:
+            return True
+        # (a lent emoji is given back by the lender's own safety-net restore)
+        log("insert: dropped a pick (the panel was closed and opened again first)")
+        return False
+
+    def _paste_if_away(self, c, typed=None, opened=None):
+        if opened is not None and not self._same_open(opened):
+            return
         if self.isActiveWindow():
             # KWin didn't move focus away: never paste into our own search box
             log("focus stayed on the picker; using hide/paste/return instead")
@@ -4091,11 +4303,13 @@ class Picker(QWidget):
         self._own_hide = True
         self.hide()
         self.busy = True
+        opened = self.open_count
 
         def after():
             QTimer.singleShot(120, self._return_after_paste)
             QTimer.singleShot(400, self._done_busy)
-        QTimer.singleShot(delay, lambda: self._send_paste(c["paste_keys"], after, typed))
+        QTimer.singleShot(delay, lambda: self._same_open(opened)
+                          and self._send_paste(c["paste_keys"], after, typed))
 
     def _return_after_paste(self):
         if self._own_hide:                       # unless you opened it again yourself meanwhile
@@ -4155,8 +4369,8 @@ class Picker(QWidget):
         self._own_hide = False
         if self.isVisible():
             same = (mode == "clipboard") == (self.mode == "clipboard")   # emoji/kaomoji/symbols: one family
-            if same and not self.in_settings():
-                self.hide()
+            if same:
+                self.hide()                      # "open or close", from Settings too
             else:
                 if self.in_settings():
                     self.header.set_settings_mode(False)
@@ -4164,11 +4378,14 @@ class Picker(QWidget):
                 self._leave_passive()
             return
         self.conf = load_conf()
+        self.update_tone_btn()
         self.mode = mode
         self.present(token=token)
 
     def present(self, token="", keep_state=False):
         if not keep_state:
+            self.open_count += 1
+            self.busy = False            # a paste from before this opening doesn't hold it
             if self.in_settings():
                 self.header.set_settings_mode(False)
             self.search.blockSignals(True); self.search.clear(); self.search.blockSignals(False)
@@ -4283,9 +4500,24 @@ def main():
     except Exception:
         pass
     log(f"starting (pid {os.getpid()}, wayland={bool(os.environ.get('WAYLAND_DISPLAY'))})")
-    import signal
+    import signal, traceback
+
+    def log_error(kind, value, tb):
+        # PyQt6 aborts the whole app on an error in any slot, without cleaning up
+        # (wl-paste --watch was left running until logout). Log it and carry on.
+        # The message itself is left out: it could quote clipboard text.
+        log(f"unexpected error ({kind.__name__}), kept running:\n"
+            + "".join(traceback.format_tb(tb)).rstrip())
+    sys.excepthook = log_error
     signal.signal(signal.SIGINT, signal.SIG_DFL)   # let Ctrl+C stop it in a terminal
     app = QApplication(sys.argv)
+
+    def on_term(*_):
+        # pkill / logout: quit properly, so helpers like wl-paste stop with it
+        signal.signal(signal.SIGTERM, signal.SIG_DFL)    # a second one kills it outright
+        QTimer.singleShot(0, app.quit)
+    signal.signal(signal.SIGTERM, on_term)
+    wake = QTimer(); wake.timeout.connect(lambda: None); wake.start(500)   # Python only sees signals while running
     app.setApplicationName(APP_ID)
     app.setDesktopFileName(APP_ID)
     app.setQuitOnLastWindowClosed(False)
